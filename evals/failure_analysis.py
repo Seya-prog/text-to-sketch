@@ -730,7 +730,12 @@ def parse_args() -> argparse.Namespace:
     conv.add_argument("--min-cosine", type=float, default=0.999)
     conv.add_argument("--min-agreement", type=float, default=0.99)
 
-    # 9. Run all analyses
+    # 9. Plot figures from analysis
+    plot_cmd = sub.add_parser("plot", help="Generate publication figures from analysis results")
+    plot_cmd.add_argument("--analysis-dir", default="evals/results/analysis")
+    plot_cmd.add_argument("--output-dir", default="evals/results/analysis/figures")
+
+    # 10. Run all analyses
     all_cmd = sub.add_parser("all", help="Run all available analyses")
     all_cmd.add_argument("--dataset-root", default="data/processed/sketchformer-ready-data/tok-dict")
     all_cmd.add_argument("--codebook-path", default="data/processed/sketch_token/codebook.npy")
@@ -743,6 +748,7 @@ def parse_args() -> argparse.Namespace:
     all_cmd.add_argument("--candidate-logits", default=None)
     all_cmd.add_argument("--reference-logits", default=None)
     all_cmd.add_argument("--output-dir", default="evals/results/analysis")
+    all_cmd.add_argument("--plots", action="store_true", help="Generate figures after analysis completes")
 
     return parser.parse_args()
 
@@ -793,6 +799,11 @@ def main() -> int:
             min_cosine=args.min_cosine,
             min_agreement=args.min_agreement,
         )
+
+    elif args.command == "plot":
+        from evals.visualize_failure_analysis import generate_all_plots
+
+        generate_all_plots(PROJECT_ROOT / args.analysis_dir, PROJECT_ROOT / args.output_dir)
 
     elif args.command == "all":
         dataset_root = PROJECT_ROOT / args.dataset_root
@@ -852,6 +863,12 @@ def main() -> int:
                 Path(args.reference_logits),
                 output_dir=out_dir,
             )
+
+        if args.plots:
+            print("\n--- 9. Generating Figures ---")
+            from evals.visualize_failure_analysis import generate_all_plots
+
+            generate_all_plots(out_dir, out_dir / "figures")
 
     return 0
 

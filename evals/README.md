@@ -23,10 +23,11 @@ evaluation, reports per-bucket metrics, and saves a JSON report with full
 provenance (checkpoint hash, codebook hash, config hash, seed, timestamp).
 
 ```bash
-# Full benchmark (both modes)
+# Full benchmark (both modes) + 50 qualitative comparison plots
 python evals/benchmark_eval.py \
   --checkpoint weights/pretrained/sketchformer_tok_dict_init.safetensors \
   --split valid \
+  --num-plots 50 \
   --output-dir evals/results \
   --run-name baseline_valid
 
@@ -44,11 +45,10 @@ python evals/benchmark_eval.py \
   --modes teacher-forced \
   --split valid
 
-# Free-running only with custom plot count
+# Free-running only
 python evals/benchmark_eval.py \
   --checkpoint weights/pretrained/sketchformer_tok_dict_init.safetensors \
   --modes free-running \
-  --num-plots 50 \
   --split valid
 ```
 
@@ -69,11 +69,12 @@ python evals/conversion_fidelity.py \
 Diagnostic analysis suite for investigating model failure modes across all Phase 1 dimensions:
 
 ```bash
-# Run all analyses that have available data
+# Run all analyses and automatically generate publication figures
 python evals/failure_analysis.py all \
   --dataset-root data/processed/sketchformer-ready-data/tok-dict \
   --codebook-path data/processed/sketch_token/codebook.npy \
   --split valid \
+  --plots \
   --output-dir evals/results/analysis
 
 # 1. TF vs FR gap analysis
@@ -103,7 +104,28 @@ python evals/failure_analysis.py quantization \
 # 7. 128-dim latent bottleneck effective dimension & SVD spectrum
 python evals/failure_analysis.py latent-capacity \
   --latent-vectors evals/results/validation_latents.npy
+
+# 8. Generate figures from an existing analysis directory
+python evals/failure_analysis.py plot \
+  --analysis-dir evals/results/analysis \
+  --output-dir evals/results/analysis/figures
 ```
+
+### 5. Failure Analysis Visualizer (`visualize_failure_analysis.py`)
+
+Generates standalone publication-ready figures for reports and papers:
+
+```bash
+python evals/visualize_failure_analysis.py \
+  --analysis-dir evals/results/analysis \
+  --output-dir evals/results/analysis/figures
+```
+
+Generated plots:
+- `figure_position_accuracy_curves.png`: Sequence position vs token accuracy per bucket with Onset (80%) and Collapse (50%) thresholds
+- `figure_tf_vs_fr_gap.png`: Grouped bar chart comparing Teacher-Forced vs Free-Running accuracy with gap annotations
+- `figure_codebook_usage.png`: Active vs dead token donut chart and Zipfian log-log usage frequency curve
+- `figure_latent_capacity_scree.png`: Cumulative variance explained scree plot for the 128-dim bottleneck
 
 ## Output Structure
 
@@ -114,7 +136,7 @@ evals/
 └── results/
     ├── baseline_valid_report.json    # Frozen baseline numbers + provenance
     ├── baseline_valid_per_sample.jsonl  # Per-sample free-running records (+ predictions)
-    ├── baseline_valid_plots/         # 50 comparison visualizations
+    ├── baseline_valid_plots/         # 50 qualitative comparison visualizations
     ├── conversion_fidelity/
     │   └── conversion_fidelity_report.json
     └── analysis/
@@ -125,5 +147,10 @@ evals/
         ├── codebook_analysis.json
         ├── codebook_usage_counts.npy
         ├── quantization_analysis.json
-        └── latent_capacity_analysis.json
+        ├── latent_capacity_analysis.json
+        └── figures/
+            ├── figure_position_accuracy_curves.png
+            ├── figure_tf_vs_fr_gap.png
+            ├── figure_codebook_usage.png
+            └── figure_latent_capacity_scree.png
 ```
