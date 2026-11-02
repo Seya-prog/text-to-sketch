@@ -48,7 +48,9 @@ def analyze_tf_fr_gap(
     per-sample records, this computes the gap at the bucket level.
     """
     tf_report = json.loads(tf_report_path.read_text(encoding="utf-8"))
-    tf_metrics = tf_report.get("teacher_forced", {}).get("metrics", {})
+    tf_data = tf_report.get("teacher_forced", {})
+    tf_metrics = tf_data.get("metrics", {})
+    tf_per_bucket = tf_data.get("per_bucket", {})
 
     fr_records = _load_jsonl(fr_per_sample_path)
     if not fr_records:
@@ -63,6 +65,7 @@ def analyze_tf_fr_gap(
     analysis: dict[str, Any] = {
         "total_samples": len(fr_records),
         "teacher_forced_metrics": tf_metrics,
+        "teacher_forced_per_bucket": tf_per_bucket,
         "per_bucket": {},
     }
 
@@ -71,9 +74,24 @@ def analyze_tf_fr_gap(
         f1_scores = [r["geometry_f1_2px"] for r in records if "geometry_f1_2px" in r]
         eos_rates = [r["eos_rate"] for r in records if "eos_rate" in r]
 
+        fr_acc = round(float(np.mean(token_accs)), 4) if token_accs else 0.0
+
+        # Bucket-aligned teacher-forced accuracy if available, else fallback to global
+        tf_bucket_data = tf_per_bucket.get(bucket, {})
+        tf_acc = tf_bucket_data.get("tf_token_accuracy_mean")
+        if tf_acc is None:
+            for k in ("valid/token_accuracy", "test/token_accuracy", "token_accuracy"):
+                if k in tf_metrics:
+                    tf_acc = round(float(tf_metrics[k]), 4)
+                    break
+
+        acc_gap = round(float(tf_acc - fr_acc), 4) if tf_acc is not None else None
+
         analysis["per_bucket"][bucket] = {
             "count": len(records),
-            "fr_token_accuracy_mean": round(float(np.mean(token_accs)), 4) if token_accs else 0.0,
+            "tf_token_accuracy_mean": tf_acc,
+            "fr_token_accuracy_mean": fr_acc,
+            "accuracy_gap_tf_minus_fr": acc_gap,
             "fr_token_accuracy_median": round(float(np.median(token_accs)), 4) if token_accs else 0.0,
             "fr_geometry_f1_mean": round(float(np.mean(f1_scores)), 4) if f1_scores else 0.0,
             "fr_geometry_f1_median": round(float(np.median(f1_scores)), 4) if f1_scores else 0.0,

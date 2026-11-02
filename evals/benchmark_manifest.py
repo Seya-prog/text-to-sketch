@@ -68,9 +68,14 @@ def annotate_sample(
     content_tokens = tokens[content_mask]
     token_length = len(content_tokens)
 
-    # Count separators and strokes
+    # Count separators and strokes (repository uses terminal separator after each stroke)
     sep_count = int(np.sum(content_tokens == sep_token_id))
-    stroke_count = sep_count + 1  # strokes = separators + 1
+    if len(content_tokens) == 0:
+        stroke_count = 0
+    elif content_tokens[-1] == sep_token_id:
+        stroke_count = sep_count
+    else:
+        stroke_count = sep_count + 1
 
     # Motion tokens (excluding separators)
     motion_count = token_length - sep_count

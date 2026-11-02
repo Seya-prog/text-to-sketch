@@ -44,6 +44,30 @@ class TestAnnotateSample(unittest.TestCase):
         self.assertEqual(result["stroke_count"], 1)
         self.assertEqual(result["motion_token_count"], 3)
 
+    def test_terminal_separators(self) -> None:
+        from evals.benchmark_manifest import annotate_sample
+
+        # Repository prepared data emits terminal separator after each stroke
+        tokens = [1002, 5, 10, 1001, 20, 30, 1001, 1003]
+        result = annotate_sample("test_term", "valid", tokens)
+
+        # 2 separators terminating 2 strokes -> stroke_count = 2
+        self.assertEqual(result["sep_count"], 2)
+        self.assertEqual(result["stroke_count"], 2)
+        self.assertEqual(result["motion_token_count"], 4)
+        self.assertEqual(result["detail_density"], 2.0)
+
+    def test_empty_sequence(self) -> None:
+        from evals.benchmark_manifest import annotate_sample
+
+        tokens = [1002, 1003, 0, 0]
+        result = annotate_sample("test_empty", "valid", tokens)
+
+        self.assertEqual(result["token_length"], 0)
+        self.assertEqual(result["sep_count"], 0)
+        self.assertEqual(result["stroke_count"], 0)
+        self.assertEqual(result["detail_density"], 0.0)
+
     def test_padded_sequence(self) -> None:
         from evals.benchmark_manifest import annotate_sample
 

@@ -65,6 +65,41 @@ class TestFailureAnalysis(unittest.TestCase):
             self.assertEqual(res["per_bucket"]["long"]["count"], 1)
             self.assertEqual(len(res["worst_20_samples"]), 3)
             self.assertEqual(res["worst_20_samples"][0]["geometry_f1_2px"], 0.40)
+            # Gap using global fallback (0.82 - 0.70 = 0.12)
+            self.assertAlmostEqual(res["per_bucket"]["short"]["accuracy_gap_tf_minus_fr"], 0.12)
+
+    def test_tf_fr_gap_with_per_bucket_tf(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            tf_report_path = tmp_path / "tf_report.json"
+            fr_samples_path = tmp_path / "fr_samples.jsonl"
+            out_dir = tmp_path / "analysis"
+
+            tf_data = {
+                "teacher_forced": {
+                    "metrics": {"valid/token_accuracy": 0.80},
+                    "per_bucket": {
+                        "short": {"tf_token_accuracy_mean": 0.85},
+                        "long": {"tf_token_accuracy_mean": 0.70},
+                    },
+                }
+            }
+            tf_report_path.write_text(json.dumps(tf_data), encoding="utf-8")
+
+            samples = [
+                {"length_bucket": "short", "token_accuracy": 0.70, "geometry_f1_2px": 0.85},
+                {"length_bucket": "long", "token_accuracy": 0.35, "geometry_f1_2px": 0.40},
+            ]
+            with open(fr_samples_path, "w", encoding="utf-8") as f:
+                for s in samples:
+                    f.write(json.dumps(s) + "\n")
+
+            res = analyze_tf_fr_gap(tf_report_path, fr_samples_path, out_dir)
+            # Bucket-aligned gaps:
+            # short: 0.85 - 0.70 = 0.15
+            # long: 0.70 - 0.35 = 0.35
+            self.assertAlmostEqual(res["per_bucket"]["short"]["accuracy_gap_tf_minus_fr"], 0.15)
+            self.assertAlmostEqual(res["per_bucket"]["long"]["accuracy_gap_tf_minus_fr"], 0.35)
 
     def test_position_accuracy_curves(self):
         # 2 samples:
@@ -174,3 +209,4 @@ class TestFailureAnalysis(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

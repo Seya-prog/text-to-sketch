@@ -74,6 +74,21 @@ def _config_hash(config: dict[str, Any]) -> str:
     return hashlib.sha256(config_str.encode()).hexdigest()[:16]
 
 
+def _load_model_checkpoint(path: Path, model: torch.nn.Module, strict: bool = False) -> None:
+    """Load model weights supporting both .safetensors and torch checkpoints."""
+    if path.suffix == ".safetensors":
+        from safetensors.torch import load_file
+
+        state_dict = load_file(str(path))
+    else:
+        checkpoint = torch.load(path, map_location="cpu")
+        if isinstance(checkpoint, dict):
+            state_dict = checkpoint.get("model", checkpoint.get("state_dict", checkpoint))
+        else:
+            state_dict = checkpoint
+    model.load_state_dict(state_dict, strict=strict)
+
+
 def _load_codebook(config: dict[str, Any]) -> np.ndarray:
     """Load the token codebook from config paths."""
     codebook_dir = get_nested(config, "data.format.token_dictionary.codebook_dir")
@@ -107,6 +122,7 @@ def run_teacher_forced(
     model.eval()
     total_samples = 0
     start_time = time.perf_counter()
+    bucket_accs: dict[str, list[float]] = {}
 
     with torch.no_grad():
         for batch in limited(loader, limit_batches):
@@ -121,12 +137,43 @@ def run_teacher_forced(
             batch_size = batch["targets"].shape[0]
             total_samples += batch_size
 
+            # Per-bucket accuracy collection
+            token_logits = getattr(getattr(output, "reconstruction", None), "token_logits", None)
+            if token_logits is not None:
+                targets = batch["targets"].to(device=token_logits.device, dtype=torch.long)
+                valid_mask = batch.get("valid_mask")
+                if valid_mask is None:
+                    valid_mask = torch.ones(targets.shape[:2], dtype=torch.bool, device=targets.device)
+                else:
+                    valid_mask = valid_mask.to(device=targets.device, dtype=torch.bool)
+                preds = torch.argmax(token_logits, dim=-1)
+                matches = (preds == targets) & valid_mask
+                lengths = batch.get("lengths")
+                from evals.benchmark_manifest import length_bucket
+                for row_i in range(batch_size):
+                    row_mask = valid_mask[row_i]
+                    if row_mask.sum() > 0:
+                        row_acc = float(matches[row_i][row_mask].float().mean().item())
+                        row_len = int(lengths[row_i]) if lengths is not None else int(row_mask.sum().item())
+                        b = length_bucket(row_len)
+                        bucket_accs.setdefault(b, []).append(row_acc)
+
     elapsed = time.perf_counter() - start_time
     weight_key = f"{split}/valid_tokens"
     summary = average_logs(
         logs,
         weight_key=weight_key if logs and weight_key in logs[0] else None,
     )
+
+    # Collect per-bucket metrics if per-sample bucket accuracies exist
+    per_bucket: dict[str, dict[str, Any]] = {}
+    if bucket_accs:
+        for b, acc_list in sorted(bucket_accs.items()):
+            per_bucket[b] = {
+                "count": len(acc_list),
+                "tf_token_accuracy_mean": round(float(np.mean(acc_list)), 4),
+                "tf_token_accuracy_median": round(float(np.median(acc_list)), 4),
+            }
 
     return {
         "mode": "teacher-forced",
@@ -136,6 +183,7 @@ def run_teacher_forced(
         "metrics": {
             key: round(float(value), 6) for key, value in summary.items()
         },
+        "per_bucket": per_bucket,
     }
 
 
@@ -187,6 +235,18 @@ def run_free_running(
                     for idx, rec in enumerate(batch_records):
                         rec["target_tokens"] = targets[idx, : t_lens[idx]].tolist()
                         rec["predicted_tokens"] = preds[idx, : p_lens[idx]].tolist()
+                # Attach sample metadata to records
+                sample_ids = batch.get("sample_ids")
+                source_files = batch.get("source_files")
+                source_indices = batch.get("source_indices")
+                for idx, rec in enumerate(batch_records):
+                    if sample_ids is not None and idx < len(sample_ids):
+                        rec["sample_id"] = str(sample_ids[idx])
+                    if source_files is not None and idx < len(source_files):
+                        rec["source_file"] = str(source_files[idx])
+                    if source_indices is not None and idx < len(source_indices):
+                        rec["source_index"] = int(source_indices[idx])
+
                 all_records.extend(batch_records)
 
             batch_size = batch["targets"].shape[0]
@@ -224,14 +284,18 @@ def build_provenance(
     args: argparse.Namespace,
     config: dict[str, Any],
     codebook_path: Path | None = None,
+    seed: int | None = None,
 ) -> dict[str, Any]:
     """Build a provenance block for full reproducibility."""
+    effective_seed = seed if seed is not None else (
+        args.seed if getattr(args, "seed", None) is not None else int(config.get("project", {}).get("seed", 42))
+    )
     provenance: dict[str, Any] = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "checkpoint": args.checkpoint,
         "experiment": args.experiment,
         "split": args.split,
-        "seed": int(config.get("project", {}).get("seed", 42)),
+        "seed": int(effective_seed),
         "config_hash": _config_hash(config),
         "data_root": config["data"]["dataset"]["root"],
         "max_generation_length": args.max_generation_length,
@@ -257,7 +321,11 @@ def build_provenance(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="configs/train.yaml")
-    parser.add_argument("--experiment", default=None)
+    parser.add_argument(
+        "--experiment",
+        default="anime_tok_dict_finetune",
+        help="Experiment name (defaults to anime_tok_dict_finetune for full 2048 sequence length).",
+    )
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--split", choices=["valid", "test"], default="valid")
     parser.add_argument("--data-root", default=None)
@@ -328,7 +396,10 @@ def main() -> int:
     # Model
     raw_model = build_model(config["model"])
     if args.checkpoint:
-        load_checkpoint(PROJECT_ROOT / args.checkpoint, raw_model, strict=False)
+        ckpt_path = Path(args.checkpoint)
+        if not ckpt_path.is_absolute():
+            ckpt_path = PROJECT_ROOT / ckpt_path
+        _load_model_checkpoint(ckpt_path, raw_model, strict=False)
         print(f"[benchmark] loaded checkpoint: {args.checkpoint}")
     else:
         print(
@@ -357,8 +428,9 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Build report
+    config.setdefault("project", {})["seed"] = seed
     report: dict[str, Any] = {
-        "provenance": build_provenance(args, config, codebook_path),
+        "provenance": build_provenance(args, config, codebook_path, seed=seed),
     }
 
     # Track peak GPU memory
