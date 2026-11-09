@@ -23,28 +23,11 @@ def _add_project_to_path() -> Path:
 
 PROJECT_ROOT = _add_project_to_path()
 
-LENGTH_BUCKETS = (
-    (1, 512, "short"),
-    (513, 1024, "medium"),
-    (1025, 2048, "long"),
-    (2049, 4096, "extended"),
+from evals.benchmark_common import (
+    LENGTH_DEFINITION,
+    length_bucket,
+    length_bucket_range,
 )
-
-
-def length_bucket(length: int) -> str:
-    """Return the human-readable bucket name for a sequence length."""
-    for low, high, name in LENGTH_BUCKETS:
-        if low <= length <= high:
-            return name
-    return "over_4096"
-
-
-def length_bucket_range(length: int) -> str:
-    """Return the numeric range bucket string (e.g. '1_512')."""
-    for low, high, _name in LENGTH_BUCKETS:
-        if low <= length <= high:
-            return f"{low}_{high}"
-    return "over_4096"
 
 
 def annotate_sample(
@@ -67,6 +50,12 @@ def annotate_sample(
     content_mask = ~np.isin(tokens, list(special))
     content_tokens = tokens[content_mask]
     token_length = len(content_tokens)
+    model_tokens = tokens[tokens != pad_token_id]
+    sequence_length = len(model_tokens)
+    if sequence_length == 0 or model_tokens[0] != sos_token_id:
+        sequence_length += 1
+    if len(model_tokens) == 0 or model_tokens[-1] != eos_token_id:
+        sequence_length += 1
 
     # Count separators and strokes (repository uses terminal separator after each stroke)
     sep_count = int(np.sum(content_tokens == sep_token_id))
@@ -91,8 +80,10 @@ def annotate_sample(
         "split": split,
         "token_length": token_length,
         "raw_length": len(tokens),
-        "length_bucket": length_bucket(token_length),
-        "length_bucket_range": length_bucket_range(token_length),
+        "sequence_length": sequence_length,
+        "length_definition": LENGTH_DEFINITION,
+        "length_bucket": length_bucket(sequence_length),
+        "length_bucket_range": length_bucket_range(sequence_length),
         "stroke_count": stroke_count,
         "sep_count": sep_count,
         "motion_token_count": motion_count,
@@ -134,27 +125,32 @@ def build_manifest(
         raise FileNotFoundError(f"No {split} files found under {dataset_root}")
 
     records: list[dict[str, Any]] = []
-    global_idx = 0
 
     for file_path in files:
-        data = np.load(file_path, allow_pickle=True)
-        sequences = data["x"]
-        for local_idx in range(len(sequences)):
-            sample_id = f"{split}_{global_idx:06d}"
-            record = annotate_sample(
-                sample_id=sample_id,
-                split=split,
-                tokens=sequences[local_idx],
-                sep_token_id=sep_token_id,
-                eos_token_id=eos_token_id,
-                sos_token_id=sos_token_id,
-                pad_token_id=pad_token_id,
-            )
-            record["source_file"] = str(file_path.relative_to(dataset_root))
-            record["source_index"] = local_idx
-            records.append(record)
-            global_idx += 1
+        with np.load(file_path, allow_pickle=True) as data:
+            sequences = data["x"]
+            for local_idx in range(len(sequences)):
+                sample_id = (
+                    str(data["sample_ids"][local_idx])
+                    if "sample_ids" in data
+                    else f"{file_path.stem}:{local_idx}"
+                )
+                record = annotate_sample(
+                    sample_id=sample_id,
+                    split=split,
+                    tokens=sequences[local_idx],
+                    sep_token_id=sep_token_id,
+                    eos_token_id=eos_token_id,
+                    sos_token_id=sos_token_id,
+                    pad_token_id=pad_token_id,
+                )
+                record["source_file"] = str(file_path.relative_to(dataset_root))
+                record["source_index"] = local_idx
+                records.append(record)
 
+    from evals.benchmark_common import records_by_id
+
+    records_by_id(records)
     return records
 
 
@@ -177,6 +173,7 @@ def summarize_manifest(records: list[dict[str, Any]]) -> dict[str, Any]:
 
     return {
         "total_samples": len(records),
+        "length_definition": LENGTH_DEFINITION,
         "length_buckets": bucket_counts,
         "token_length": {
             "min": int(np.min(lengths)),
@@ -224,7 +221,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--splits",
         nargs="+",
-        default=["valid", "test"],
+        default=["valid"],
         choices=["train", "valid", "test"],
         help="Which splits to include in the manifest.",
     )
@@ -281,4 +278,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

@@ -30,85 +30,107 @@ def _add_project_to_path() -> Path:
 
 PROJECT_ROOT = _add_project_to_path()
 
-from evals.conversion_fidelity import compute_parity_metrics, evaluate_logits_files
+from evals.conversion_fidelity import evaluate_logits_files
+from evals.benchmark_common import length_bucket, normalize_bucket, records_by_id
 
 
 # ---------------------------------------------------------------------------
 # 1. Teacher-forced vs free-running gap
 # ---------------------------------------------------------------------------
 
+
 def analyze_tf_fr_gap(
     tf_report_path: Path,
     fr_per_sample_path: Path,
     output_dir: Path,
 ) -> dict[str, Any]:
-    """Compare teacher-forced and free-running quality per length bucket.
-
-    Since teacher-forced metrics are batch-aggregated and free-running has
-    per-sample records, this computes the gap at the bucket level.
-    """
+    """Join identical samples; compare macro accuracies without a global fallback."""
     tf_report = json.loads(tf_report_path.read_text(encoding="utf-8"))
     tf_data = tf_report.get("teacher_forced", {})
-    tf_metrics = tf_data.get("metrics", {})
-    tf_per_bucket = tf_data.get("per_bucket", {})
-
+    tf_records = tf_data.get("per_sample_records", [])
+    if "per_sample_path" in tf_data:
+        tf_records = _load_jsonl(tf_report_path.parent / tf_data["per_sample_path"])
     fr_records = _load_jsonl(fr_per_sample_path)
     if not fr_records:
-        return {"error": "No free-running records found"}
-
-    # Group free-running records by bucket
-    buckets: dict[str, list[dict[str, Any]]] = {}
-    for r in fr_records:
-        bucket = r.get("length_bucket", "unknown")
-        buckets.setdefault(bucket, []).append(r)
-
-    analysis: dict[str, Any] = {
+        raise ValueError("No free-running records found")
+    joined = []
+    tf_per_bucket = {
+        normalize_bucket(b): value for b, value in tf_data.get("per_bucket", {}).items()
+    }
+    if tf_records:
+        tf_by_id, fr_by_id = records_by_id(tf_records), records_by_id(fr_records)
+        if tf_by_id.keys() != fr_by_id.keys():
+            raise ValueError(
+                "TF and FR sample IDs differ; compare the same split and batch limit"
+            )
+        for sample_id in sorted(tf_by_id):
+            tf, fr = tf_by_id[sample_id], fr_by_id[sample_id]
+            for key in ("target_length", "target_sha256", "accuracy_definition"):
+                if key in tf and tf[key] != fr.get(key):
+                    raise ValueError(f"TF/FR {key} mismatch for sample {sample_id}")
+            if normalize_bucket(tf["length_bucket"]) != normalize_bucket(
+                fr["length_bucket"]
+            ):
+                raise ValueError(f"TF/FR bucket mismatch for sample {sample_id}")
+            joined.append(
+                {
+                    **fr,
+                    "length_bucket": normalize_bucket(fr["length_bucket"]),
+                    "tf_token_accuracy": float(tf["tf_token_accuracy"]),
+                    "tf_token_loss": tf.get("tf_token_loss"),
+                    "accuracy_gap_tf_minus_fr": float(tf["tf_token_accuracy"])
+                    - float(fr["token_accuracy"]),
+                }
+            )
+    elif not tf_per_bucket:
+        raise ValueError(
+            "No bucket-aligned or per-sample TF scores; rerun the corrected benchmark"
+        )
+    buckets = {}
+    for record in joined or fr_records:
+        bucket = normalize_bucket(record["length_bucket"])
+        buckets.setdefault(bucket, []).append(record)
+    analysis = {
         "total_samples": len(fr_records),
-        "teacher_forced_metrics": tf_metrics,
+        "teacher_forced_metrics": tf_data.get("metrics", {}),
         "teacher_forced_per_bucket": tf_per_bucket,
+        "per_sample_gap_available": bool(joined),
         "per_bucket": {},
     }
-
     for bucket, records in sorted(buckets.items()):
-        token_accs = [r["token_accuracy"] for r in records if "token_accuracy" in r]
-        f1_scores = [r["geometry_f1_2px"] for r in records if "geometry_f1_2px" in r]
-        eos_rates = [r["eos_rate"] for r in records if "eos_rate" in r]
-
-        fr_acc = round(float(np.mean(token_accs)), 4) if token_accs else 0.0
-
-        # Bucket-aligned teacher-forced accuracy if available, else fallback to global
-        tf_bucket_data = tf_per_bucket.get(bucket, {})
-        tf_acc = tf_bucket_data.get("tf_token_accuracy_mean")
-        if tf_acc is None:
-            for k in ("valid/token_accuracy", "test/token_accuracy", "token_accuracy"):
-                if k in tf_metrics:
-                    tf_acc = round(float(tf_metrics[k]), 4)
-                    break
-
-        acc_gap = round(float(tf_acc - fr_acc), 4) if tf_acc is not None else None
-
+        fr_acc = float(np.mean([r["token_accuracy"] for r in records]))
+        if joined:
+            tf_acc = float(np.mean([r["tf_token_accuracy"] for r in records]))
+        else:
+            tf_acc = tf_per_bucket.get(bucket, {}).get("tf_token_accuracy_mean")
+            if tf_acc is None:
+                raise ValueError(
+                    f"Missing TF scores for {bucket}; global accuracy cannot replace them"
+                )
+        f1 = [r["geometry_f1_2px"] for r in records if "geometry_f1_2px" in r]
+        eos = [r["eos_rate"] for r in records if "eos_rate" in r]
         analysis["per_bucket"][bucket] = {
             "count": len(records),
             "tf_token_accuracy_mean": tf_acc,
             "fr_token_accuracy_mean": fr_acc,
-            "accuracy_gap_tf_minus_fr": acc_gap,
-            "fr_token_accuracy_median": round(float(np.median(token_accs)), 4) if token_accs else 0.0,
-            "fr_geometry_f1_mean": round(float(np.mean(f1_scores)), 4) if f1_scores else 0.0,
-            "fr_geometry_f1_median": round(float(np.median(f1_scores)), 4) if f1_scores else 0.0,
-            "fr_eos_rate": round(float(np.mean(eos_rates)), 4) if eos_rates else 0.0,
+            "accuracy_gap_tf_minus_fr": float(tf_acc) - fr_acc,
+            "fr_token_accuracy_median": float(
+                np.median([r["token_accuracy"] for r in records])
+            ),
+            "fr_geometry_f1_mean": float(np.mean(f1)) if f1 else None,
+            "fr_geometry_f1_median": float(np.median(f1)) if f1 else None,
+            "fr_eos_rate": float(np.mean(eos)) if eos else None,
         }
-
-    # Worst samples by geometry F1
-    if any("geometry_f1_2px" in r for r in fr_records):
-        sorted_by_f1 = sorted(
-            fr_records, key=lambda r: float(r.get("geometry_f1_2px", 0.0))
-        )
-        analysis["worst_20_samples"] = sorted_by_f1[:20]
-
-    output_path = output_dir / "tf_vs_fr_gap_analysis.json"
+    if joined:
+        analysis["per_sample_records"] = joined
+        analysis["worst_20_samples"] = sorted(
+            joined,
+            key=lambda r: (-r["accuracy_gap_tf_minus_fr"], str(r["sample_id"])),
+        )[:20]
+    output_path = Path(output_dir) / "tf_vs_fr_gap_analysis.json"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(
-        json.dumps(analysis, indent=2, default=str), encoding="utf-8"
+        json.dumps(analysis, indent=2, allow_nan=False), encoding="utf-8"
     )
     print(f"[analysis] wrote TF vs FR gap analysis to {output_path}")
     return analysis
@@ -117,6 +139,7 @@ def analyze_tf_fr_gap(
 # ---------------------------------------------------------------------------
 # 2. Position-accuracy curves (Long-Sequence Error Accumulation)
 # ---------------------------------------------------------------------------
+
 
 def analyze_position_accuracy(
     records_or_path: list[dict[str, Any]] | Path,
@@ -141,26 +164,33 @@ def analyze_position_accuracy(
     if not records:
         return {"error": "No prediction records provided"}
 
+    if any("target_tokens" not in r or "predicted_tokens" not in r for r in records):
+        raise ValueError(
+            "Prediction arrays are required; run benchmark_eval.py with --save-predictions"
+        )
+
     # Separate records by bucket
     buckets: dict[str, list[dict[str, Any]]] = {}
     for r in records:
         target = r.get("target_tokens", [])
         bucket = r.get("length_bucket")
         if not bucket:
-            length = len(target)
-            if length <= 512:
-                bucket = "short"
-            elif length <= 1024:
-                bucket = "medium"
-            elif length <= 1536:
-                bucket = "long"
-            else:
-                bucket = "extended"
+            bucket = length_bucket(len(target))
+        else:
+            bucket = normalize_bucket(bucket)
         buckets.setdefault(bucket, []).append(r)
 
     def _compute_curve(bucket_records: list[dict[str, Any]]) -> dict[str, Any]:
-        targets = [np.asarray(r["target_tokens"], dtype=np.int64) for r in bucket_records if "target_tokens" in r]
-        preds = [np.asarray(r.get("predicted_tokens", []), dtype=np.int64) for r in bucket_records if "target_tokens" in r]
+        targets = [
+            np.asarray(r["target_tokens"], dtype=np.int64)
+            for r in bucket_records
+            if "target_tokens" in r
+        ]
+        preds = [
+            np.asarray(r.get("predicted_tokens", []), dtype=np.int64)
+            for r in bucket_records
+            if "target_tokens" in r
+        ]
         if not targets:
             return {}
 
@@ -199,12 +229,16 @@ def analyze_position_accuracy(
             jump = accuracies[pos] - accuracies[pos - 1]
             if jump >= 0.05:
                 # Check if previous position had separators
-                has_sep = any(pos - 1 < len(t) and t[pos - 1] == sep_token_id for t in targets)
-                recoveries.append({
-                    "position": pos,
-                    "accuracy_jump": round(jump, 4),
-                    "after_separator": has_sep,
-                })
+                has_sep = any(
+                    pos - 1 < len(t) and t[pos - 1] == sep_token_id for t in targets
+                )
+                recoveries.append(
+                    {
+                        "position": pos,
+                        "accuracy_jump": round(jump, 4),
+                        "after_separator": has_sep,
+                    }
+                )
 
         return {
             "num_samples": len(bucket_records),
@@ -214,14 +248,13 @@ def analyze_position_accuracy(
             "recovery_event_count": len(recoveries),
             "recovery_events": recoveries[:10],
             "accuracy_curve": accuracies,
+            "active_sample_counts": active_counts,
         }
 
     analysis: dict[str, Any] = {
         "total_samples": len(records),
         "overall": _compute_curve(records),
-        "by_bucket": {
-            b: _compute_curve(recs) for b, recs in sorted(buckets.items())
-        },
+        "by_bucket": {b: _compute_curve(recs) for b, recs in sorted(buckets.items())},
     }
 
     if output_dir:
@@ -237,6 +270,7 @@ def analyze_position_accuracy(
 # ---------------------------------------------------------------------------
 # 3. Separator token prediction & cascade analysis
 # ---------------------------------------------------------------------------
+
 
 def analyze_separator_confusion(
     records_or_path: list[dict[str, Any]] | Path,
@@ -260,6 +294,13 @@ def analyze_separator_confusion(
     if not records:
         return {"error": "No prediction records provided"}
 
+    if cascade_window <= 0:
+        raise ValueError("cascade_window must be positive")
+    if any("target_tokens" not in r or "predicted_tokens" not in r for r in records):
+        raise ValueError(
+            "Prediction arrays are required; run benchmark_eval.py with --save-predictions"
+        )
+
     tp = 0
     fp = 0
     fn = 0
@@ -274,8 +315,6 @@ def analyze_separator_confusion(
         if len(targets) == 0:
             continue
 
-        L = min(len(targets), len(preds))
-
         for pos in range(len(targets)):
             target_is_sep = bool(targets[pos] == sep_token_id)
             pred_is_sep = bool(pos < len(preds) and preds[pos] == sep_token_id)
@@ -288,9 +327,8 @@ def analyze_separator_confusion(
                     w_targets = targets[pos + 1 : window_end]
                     w_preds = preds[pos + 1 : min(window_end, len(preds))]
                     w_overlap = min(len(w_targets), len(w_preds))
-                    if w_overlap > 0:
-                        matches = np.sum(w_targets[:w_overlap] == w_preds[:w_overlap])
-                        acc_after_correct_sep.append(float(matches / len(w_targets)))
+                    matches = np.sum(w_targets[:w_overlap] == w_preds[:w_overlap])
+                    acc_after_correct_sep.append(float(matches / len(w_targets)))
 
             elif not target_is_sep and pred_is_sep:
                 fp += 1
@@ -302,21 +340,29 @@ def analyze_separator_confusion(
                     w_targets = targets[pos + 1 : window_end]
                     w_preds = preds[pos + 1 : min(window_end, len(preds))]
                     w_overlap = min(len(w_targets), len(w_preds))
-                    if w_overlap > 0:
-                        matches = np.sum(w_targets[:w_overlap] == w_preds[:w_overlap])
-                        acc_after_missed_sep.append(float(matches / len(w_targets)))
+                    matches = np.sum(w_targets[:w_overlap] == w_preds[:w_overlap])
+                    acc_after_missed_sep.append(float(matches / len(w_targets)))
             else:
                 tn += 1
 
     precision = float(tp / (tp + fp)) if (tp + fp) > 0 else 0.0
     recall = float(tp / (tp + fn)) if (tp + fn) > 0 else 0.0
-    f1 = float(2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+    f1 = (
+        float(2 * precision * recall / (precision + recall))
+        if (precision + recall) > 0
+        else 0.0
+    )
     false_sep_rate = float(fp / (fp + tn)) if (fp + tn) > 0 else 0.0
     missed_sep_rate = float(fn / (fn + tp)) if (fn + tp) > 0 else 0.0
 
-    mean_acc_correct = float(np.mean(acc_after_correct_sep)) if acc_after_correct_sep else 0.0
-    mean_acc_missed = float(np.mean(acc_after_missed_sep)) if acc_after_missed_sep else 0.0
-    cascade_penalty = mean_acc_correct - mean_acc_missed
+    mean_acc_correct = (
+        float(np.mean(acc_after_correct_sep)) if acc_after_correct_sep else 0.0
+    )
+    mean_acc_missed = (
+        float(np.mean(acc_after_missed_sep)) if acc_after_missed_sep else 0.0
+    )
+    has_comparison = bool(acc_after_correct_sep and acc_after_missed_sep)
+    cascade_penalty = mean_acc_correct - mean_acc_missed if has_comparison else None
 
     analysis = {
         "confusion_matrix": {
@@ -336,8 +382,12 @@ def analyze_separator_confusion(
             "cascade_window_tokens": cascade_window,
             "accuracy_after_correct_separator": round(mean_acc_correct, 4),
             "accuracy_after_missed_separator": round(mean_acc_missed, 4),
-            "cascade_penalty": round(cascade_penalty, 4),
-            "cascade_effect_detected": bool(cascade_penalty > 0.05),
+            "correct_separator_windows": len(acc_after_correct_sep),
+            "missed_separator_windows": len(acc_after_missed_sep),
+            "cascade_penalty": round(cascade_penalty, 4) if has_comparison else None,
+            "cascade_effect_detected": bool(cascade_penalty > 0.05)
+            if has_comparison
+            else None,
         },
     }
 
@@ -354,6 +404,7 @@ def analyze_separator_confusion(
 # ---------------------------------------------------------------------------
 # 4. Separator dataset distribution
 # ---------------------------------------------------------------------------
+
 
 def analyze_separators(
     dataset_root: Path,
@@ -415,16 +466,16 @@ def analyze_separators(
         },
         "correlation_length_vs_sep_count": round(
             float(np.corrcoef(lengths, sep_counts)[0, 1]), 4
-        ) if len(lengths) > 1 else 0.0,
+        )
+        if len(lengths) > 1
+        else 0.0,
     }
 
     if output_dir:
         output_dir = Path(output_dir)
         output_path = output_dir / "separator_analysis.json"
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(
-            json.dumps(analysis, indent=2), encoding="utf-8"
-        )
+        output_path.write_text(json.dumps(analysis, indent=2), encoding="utf-8")
         print(f"[analysis] wrote separator analysis to {output_path}")
 
     return analysis
@@ -433,6 +484,7 @@ def analyze_separators(
 # ---------------------------------------------------------------------------
 # 5. Codebook coverage & quantization error
 # ---------------------------------------------------------------------------
+
 
 def analyze_codebook(
     codebook_path: Path,
@@ -507,9 +559,15 @@ def analyze_codebook(
         "usage_distribution": {
             "min": int(np.min(nonzero_counts)) if len(nonzero_counts) > 0 else 0,
             "max": int(np.max(nonzero_counts)) if len(nonzero_counts) > 0 else 0,
-            "mean": round(float(np.mean(nonzero_counts)), 1) if len(nonzero_counts) > 0 else 0.0,
-            "median": round(float(np.median(nonzero_counts)), 1) if len(nonzero_counts) > 0 else 0.0,
-            "std": round(float(np.std(nonzero_counts)), 1) if len(nonzero_counts) > 0 else 0.0,
+            "mean": round(float(np.mean(nonzero_counts)), 1)
+            if len(nonzero_counts) > 0
+            else 0.0,
+            "median": round(float(np.median(nonzero_counts)), 1)
+            if len(nonzero_counts) > 0
+            else 0.0,
+            "std": round(float(np.std(nonzero_counts)), 1)
+            if len(nonzero_counts) > 0
+            else 0.0,
         },
         "top_10_entries": top_10,
         "bottom_10_used_entries": bottom_10_used,
@@ -524,9 +582,7 @@ def analyze_codebook(
         output_dir = Path(output_dir)
         output_path = output_dir / "codebook_analysis.json"
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(
-            json.dumps(analysis, indent=2), encoding="utf-8"
-        )
+        output_path.write_text(json.dumps(analysis, indent=2), encoding="utf-8")
         print(f"[analysis] wrote codebook analysis to {output_path}")
 
         hist_path = output_dir / "codebook_usage_counts.npy"
@@ -585,7 +641,9 @@ def analyze_quantization_error(
         },
         "stroke_endpoint_drift": {
             "mean": round(float(np.mean(stroke_drifts)), 4) if stroke_drifts else 0.0,
-            "median": round(float(np.median(stroke_drifts)), 4) if stroke_drifts else 0.0,
+            "median": round(float(np.median(stroke_drifts)), 4)
+            if stroke_drifts
+            else 0.0,
             "max": round(float(np.max(stroke_drifts)), 4) if stroke_drifts else 0.0,
             "std": round(float(np.std(stroke_drifts)), 4) if stroke_drifts else 0.0,
         },
@@ -605,6 +663,7 @@ def analyze_quantization_error(
 # 6. Latent representation capacity (128-dim Bottleneck Analysis)
 # ---------------------------------------------------------------------------
 
+
 def analyze_latent_capacity(
     latent_vectors: np.ndarray,
     output_dir: Path | None = None,
@@ -613,10 +672,10 @@ def analyze_latent_capacity(
 
     Computes SVD singular values and participation ratio (PR) to determine
     whether the 128-dim bottleneck is under-utilized or saturating:
-        PR = (sum(s_i))^2 / sum(s_i^2)
+        PR = (sum(s_i^2))^2 / sum(s_i^4), using covariance eigenvalues.
     """
     Z = np.asarray(latent_vectors, dtype=np.float32)
-    if Z.ndim != 2:
+    if Z.ndim != 2 or min(Z.shape, default=0) == 0 or not np.isfinite(Z).all():
         raise ValueError(f"Expected 2D latent matrix (N, D), got {Z.shape}")
 
     num_samples, dim = Z.shape
@@ -624,12 +683,16 @@ def analyze_latent_capacity(
 
     # Singular Value Decomposition
     _, s, _ = np.linalg.svd(centered, full_matrices=False)
-    variance_explained = (s ** 2) / np.sum(s ** 2) if np.sum(s ** 2) > 0 else np.zeros_like(s)
+    variance_explained = (s**2) / np.sum(s**2) if np.sum(s**2) > 0 else np.zeros_like(s)
 
     # Participation Ratio (effective dimension)
-    sum_s = float(np.sum(s))
-    sum_s2 = float(np.sum(s ** 2))
-    participation_ratio = (sum_s ** 2) / sum_s2 if sum_s2 > 0 else 0.0
+    eigenvalues = s.astype(np.float64) ** 2
+    sum_eigenvalues2 = float(np.sum(eigenvalues**2))
+    participation_ratio = (
+        float(np.sum(eigenvalues) ** 2 / sum_eigenvalues2)
+        if sum_eigenvalues2 > 0
+        else 0.0
+    )
 
     cumulative_var = np.cumsum(variance_explained)
     top_components = {
@@ -661,6 +724,7 @@ def analyze_latent_capacity(
 # Utilities
 # ---------------------------------------------------------------------------
 
+
 def _load_jsonl(path: Path) -> list[dict[str, Any]]:
     """Load a JSONL file into a list of dicts."""
     records = []
@@ -676,6 +740,7 @@ def _load_jsonl(path: Path) -> list[dict[str, Any]]:
 # CLI
 # ---------------------------------------------------------------------------
 
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run failure analysis on benchmark evaluation results."
@@ -689,56 +754,100 @@ def parse_args() -> argparse.Namespace:
     gap.add_argument("--output-dir", default="evals/results/analysis")
 
     # 2. Position accuracy curves
-    pos = sub.add_parser("position-curves", help="Compute position-accuracy curves and collapse point")
-    pos.add_argument("--predictions", required=True, help="Path to JSONL with target_tokens and predicted_tokens")
+    pos = sub.add_parser(
+        "position-curves", help="Compute position-accuracy curves and collapse point"
+    )
+    pos.add_argument(
+        "--predictions",
+        required=True,
+        help="Path to JSONL with target_tokens and predicted_tokens",
+    )
     pos.add_argument("--output-dir", default="evals/results/analysis")
 
     # 3. Separator confusion
-    sep_conf = sub.add_parser("separator-confusion", help="Compute separator confusion and cascade penalty")
-    sep_conf.add_argument("--predictions", required=True, help="Path to JSONL with target_tokens and predicted_tokens")
+    sep_conf = sub.add_parser(
+        "separator-confusion", help="Compute separator confusion and cascade penalty"
+    )
+    sep_conf.add_argument(
+        "--predictions",
+        required=True,
+        help="Path to JSONL with target_tokens and predicted_tokens",
+    )
     sep_conf.add_argument("--output-dir", default="evals/results/analysis")
 
     # 4. Separator dataset distribution
     sep = sub.add_parser("separators", help="Analyze separator token distribution")
-    sep.add_argument("--dataset-root", default="data/processed/sketchformer-ready-data/tok-dict")
+    sep.add_argument(
+        "--dataset-root", default="data/processed/sketchformer-ready-data/tok-dict"
+    )
     sep.add_argument("--split", default="valid")
     sep.add_argument("--output-dir", default="evals/results/analysis")
 
     # 5. Codebook analysis
     cb = sub.add_parser("codebook", help="Analyze codebook coverage and usage")
-    cb.add_argument("--codebook-path", default="data/processed/sketch_token/codebook.npy")
-    cb.add_argument("--dataset-root", default="data/processed/sketchformer-ready-data/tok-dict")
+    cb.add_argument(
+        "--codebook-path", default="data/processed/sketch_token/codebook.npy"
+    )
+    cb.add_argument(
+        "--dataset-root", default="data/processed/sketchformer-ready-data/tok-dict"
+    )
     cb.add_argument("--split", default="valid")
     cb.add_argument("--output-dir", default="evals/results/analysis")
 
     # 6. Quantization error
-    quant = sub.add_parser("quantization", help="Measure codebook point error and endpoint drift")
-    quant.add_argument("--stroke5-dir", required=True, help="Directory containing Stroke-5 .npz files")
-    quant.add_argument("--codebook-path", default="data/processed/sketch_token/codebook.npy")
+    quant = sub.add_parser(
+        "quantization", help="Measure codebook point error and endpoint drift"
+    )
+    quant.add_argument(
+        "--stroke5-dir", required=True, help="Directory containing Stroke-5 .npz files"
+    )
+    quant.add_argument(
+        "--codebook-path", default="data/processed/sketch_token/codebook.npy"
+    )
     quant.add_argument("--output-dir", default="evals/results/analysis")
 
     # 7. Latent capacity
-    lat = sub.add_parser("latent-capacity", help="Analyze 128-dim latent bottleneck effective dimension")
-    lat.add_argument("--latent-vectors", required=True, help="Path to .npy or .npz containing latent embeddings")
+    lat = sub.add_parser(
+        "latent-capacity", help="Analyze 128-dim latent bottleneck effective dimension"
+    )
+    lat.add_argument(
+        "--latent-vectors",
+        required=True,
+        help="Path to .npy or .npz containing latent embeddings",
+    )
     lat.add_argument("--output-dir", default="evals/results/analysis")
 
     # 8. Conversion fidelity
     conv = sub.add_parser("conversion", help="Verify TF-to-PyTorch logit parity")
-    conv.add_argument("--candidate-logits", required=True, help="Path to PyTorch candidate logits (.npy or .npz)")
-    conv.add_argument("--reference-logits", required=True, help="Path to TF reference logits (.npy or .npz)")
+    conv.add_argument(
+        "--candidate-logits",
+        required=True,
+        help="Path to PyTorch candidate logits (.npy or .npz)",
+    )
+    conv.add_argument(
+        "--reference-logits",
+        required=True,
+        help="Path to TF reference logits (.npy or .npz)",
+    )
     conv.add_argument("--output-dir", default="evals/results/analysis")
     conv.add_argument("--min-cosine", type=float, default=0.999)
     conv.add_argument("--min-agreement", type=float, default=0.99)
 
     # 9. Plot figures from analysis
-    plot_cmd = sub.add_parser("plot", help="Generate publication figures from analysis results")
+    plot_cmd = sub.add_parser(
+        "plot", help="Generate publication figures from analysis results"
+    )
     plot_cmd.add_argument("--analysis-dir", default="evals/results/analysis")
     plot_cmd.add_argument("--output-dir", default="evals/results/analysis/figures")
 
     # 10. Run all analyses
     all_cmd = sub.add_parser("all", help="Run all available analyses")
-    all_cmd.add_argument("--dataset-root", default="data/processed/sketchformer-ready-data/tok-dict")
-    all_cmd.add_argument("--codebook-path", default="data/processed/sketch_token/codebook.npy")
+    all_cmd.add_argument(
+        "--dataset-root", default="data/processed/sketchformer-ready-data/tok-dict"
+    )
+    all_cmd.add_argument(
+        "--codebook-path", default="data/processed/sketch_token/codebook.npy"
+    )
     all_cmd.add_argument("--split", default="valid")
     all_cmd.add_argument("--tf-report", default=None)
     all_cmd.add_argument("--fr-per-sample", default=None)
@@ -748,14 +857,21 @@ def parse_args() -> argparse.Namespace:
     all_cmd.add_argument("--candidate-logits", default=None)
     all_cmd.add_argument("--reference-logits", default=None)
     all_cmd.add_argument("--output-dir", default="evals/results/analysis")
-    all_cmd.add_argument("--plots", action="store_true", help="Generate figures after analysis completes")
+    all_cmd.add_argument(
+        "--plots", action="store_true", help="Generate figures after analysis completes"
+    )
 
+    for command in (conv, all_cmd):
+        validity = command.add_mutually_exclusive_group()
+        validity.add_argument("--valid-mask", type=Path, default=None)
+        validity.add_argument("--lengths", type=Path, default=None)
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
     out_dir = PROJECT_ROOT / args.output_dir
+    exit_code = 0
 
     if args.command == "gap":
         analyze_tf_fr_gap(Path(args.tf_report), Path(args.fr_per_sample), out_dir)
@@ -767,7 +883,9 @@ def main() -> int:
         analyze_separator_confusion(Path(args.predictions), output_dir=out_dir)
 
     elif args.command == "separators":
-        analyze_separators(PROJECT_ROOT / args.dataset_root, args.split, output_dir=out_dir)
+        analyze_separators(
+            PROJECT_ROOT / args.dataset_root, args.split, output_dir=out_dir
+        )
 
     elif args.command == "codebook":
         analyze_codebook(
@@ -780,7 +898,10 @@ def main() -> int:
     elif args.command == "quantization":
         stroke5_dir = Path(args.stroke5_dir)
         arrays = [
-            np.asarray(np.load(p, allow_pickle=True)[np.load(p, allow_pickle=True).files[0]], dtype=np.float32)
+            np.asarray(
+                np.load(p, allow_pickle=True)[np.load(p, allow_pickle=True).files[0]],
+                dtype=np.float32,
+            )
             for p in sorted(stroke5_dir.glob("*.npz"))
         ]
         codebook = np.load(PROJECT_ROOT / args.codebook_path)
@@ -792,18 +913,23 @@ def main() -> int:
         analyze_latent_capacity(latents, output_dir=out_dir)
 
     elif args.command == "conversion":
-        evaluate_logits_files(
+        report = evaluate_logits_files(
             Path(args.candidate_logits),
             Path(args.reference_logits),
             output_dir=out_dir,
             min_cosine=args.min_cosine,
             min_agreement=args.min_agreement,
+            valid_mask_path=args.valid_mask,
+            lengths_path=args.lengths,
         )
+        exit_code = 0 if report["status"] == "PASS" else 1
 
     elif args.command == "plot":
         from evals.visualize_failure_analysis import generate_all_plots
 
-        generate_all_plots(PROJECT_ROOT / args.analysis_dir, PROJECT_ROOT / args.output_dir)
+        generate_all_plots(
+            PROJECT_ROOT / args.analysis_dir, PROJECT_ROOT / args.output_dir
+        )
 
     elif args.command == "all":
         dataset_root = PROJECT_ROOT / args.dataset_root
@@ -822,7 +948,9 @@ def main() -> int:
         codebook_path = PROJECT_ROOT / args.codebook_path
         if codebook_path.exists() and dataset_root.exists():
             print("\n--- 2. Codebook Coverage Analysis ---")
-            analyze_codebook(codebook_path, dataset_root, args.split, output_dir=out_dir)
+            analyze_codebook(
+                codebook_path, dataset_root, args.split, output_dir=out_dir
+            )
         else:
             print("[skip] codebook or dataset not found")
 
@@ -843,10 +971,17 @@ def main() -> int:
             print("\n--- 6. Codebook Quantization Error ---")
             stroke5_dir = Path(args.stroke5_dir)
             arrays = [
-                np.asarray(np.load(p, allow_pickle=True)[np.load(p, allow_pickle=True).files[0]], dtype=np.float32)
+                np.asarray(
+                    np.load(p, allow_pickle=True)[
+                        np.load(p, allow_pickle=True).files[0]
+                    ],
+                    dtype=np.float32,
+                )
                 for p in sorted(stroke5_dir.glob("*.npz"))
             ]
-            analyze_quantization_error(arrays, np.load(codebook_path), output_dir=out_dir)
+            analyze_quantization_error(
+                arrays, np.load(codebook_path), output_dir=out_dir
+            )
 
         # 6. Latent capacity
         if args.latent_vectors:
@@ -858,11 +993,15 @@ def main() -> int:
         # 7. Conversion fidelity
         if args.candidate_logits and args.reference_logits:
             print("\n--- 8. Conversion Fidelity ---")
-            evaluate_logits_files(
+            report = evaluate_logits_files(
                 Path(args.candidate_logits),
                 Path(args.reference_logits),
                 output_dir=out_dir,
+                valid_mask_path=args.valid_mask,
+                lengths_path=args.lengths,
             )
+            if report["status"] != "PASS":
+                exit_code = 1
 
         if args.plots:
             print("\n--- 9. Generating Figures ---")
@@ -870,7 +1009,7 @@ def main() -> int:
 
             generate_all_plots(out_dir, out_dir / "figures")
 
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":

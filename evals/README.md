@@ -1,61 +1,158 @@
-# Benchmark Evaluation and Failure Analysis
+# Benchmark evaluation and failure analysis
 
-Phase 1 Weeks 1–2 tooling for evaluating the Sketchformer prediction model.
+These tools prepare the Phase 1 study. They do not convert TensorFlow checkpoints,
+train a model, or supply real baseline measurements. Run the study on the GPU
+server with the actual development dataset, codebook, and compatible weights.
+The held-out test split is evaluated only when explicitly selected.
 
-## Scripts
+## Before running on the server
 
-### 1. Benchmark Manifest (`benchmark_manifest.py`)
+Install the repository dependencies and editable package in your server's Python
+3.10/3.11 environment. Install the PyTorch CUDA wheels appropriate for its NVIDIA
+driver. Check `torch.cuda.is_available()` before requesting `--device cuda`.
+Run the CPU regression suite first:
 
-Generates a stratified JSONL manifest annotating every sample with length bucket,
-stroke count, detail density, and separator ratio.
+```bash
+python -B -m unittest discover -s tests -v
+```
+
+Use a checkpoint converted for the selected architecture/sequence-length experiment.
+For example, `anime_tok_dict_long` needs the corresponding 4096-token initialization
+or fine-tuned checkpoint. A 2048-token checkpoint is not interchangeable with it.
+Weight loading is strict by default. `--allow-partial-checkpoint` is an explicit
+experimental override; missing/unexpected keys are recorded in the report. A file
+with no matching weights is rejected. `--allow-random-init` is for synthetic smoke
+tests, not the pretrained baseline.
+
+Benchmarking disables truncation regardless of the training configuration and
+checks the entire requested split before inference. An overlong sample causes an
+error identifying the sample; choose a compatible longer-sequence experiment and
+checkpoint. Targets are never shortened to fit the default 2048-token experiment.
+`--max-generation-length` limits generation only; missing output tokens still count
+as errors against the complete target. Leave it unset for the full baseline.
+
+## 1. Annotate the development split
 
 ```bash
 python evals/benchmark_manifest.py \
-  --dataset-root data/processed/sketchformer-ready-data/tok-dict \
-  --splits valid test \
+  --dataset-root data/processed/sketchformer-ready-data/tok-dict-4096 \
+  --splits valid \
   --output evals/benchmark_manifest.jsonl
 ```
 
-### 2. Benchmark Evaluation (`benchmark_eval.py`)
+Sample IDs match the prepared `sample_ids` array, or fall back to `shard_stem:index`,
+as in the model dataloader. IDs must be unique. `sequence_length` and bucket assignment
+count non-padding model input tokens **including SOS and EOS**. The legacy
+`token_length` field describes content tokens excluding SOS, EOS and padding;
+`motion_token_count` additionally excludes separators. Numeric legacy bucket names
+(e.g. `1_512`) are normalized to `short`, `medium`, `long`, and `extended` by diagnostics.
 
-Deterministic evaluation harness that runs both teacher-forced and free-running
-evaluation, reports per-bucket metrics, and saves a JSON report with full
-provenance (checkpoint hash, codebook hash, config hash, seed, timestamp).
+## 2. Freeze a real baseline
+
+Replace the artifact locations with those on your server. `--codebook-path` changes
+the file location; it does not change the checkpoint's token layout or vocabulary.
 
 ```bash
-# Full benchmark (both modes) + 50 qualitative comparison plots
 python evals/benchmark_eval.py \
-  --checkpoint weights/pretrained/sketchformer_tok_dict_init.safetensors \
-  --split valid \
-  --num-plots 50 \
-  --output-dir evals/results \
-  --run-name baseline_valid
-
-# Save predictions for failure analysis (position-curves & separator-confusion)
-python evals/benchmark_eval.py \
-  --checkpoint weights/pretrained/sketchformer_tok_dict_init.safetensors \
-  --split valid \
-  --save-predictions \
-  --output-dir evals/results \
-  --run-name baseline_valid
-
-# Teacher-forced only
-python evals/benchmark_eval.py \
-  --checkpoint weights/pretrained/sketchformer_tok_dict_init.safetensors \
-  --modes teacher-forced \
-  --split valid
-
-# Free-running only
-python evals/benchmark_eval.py \
-  --checkpoint weights/pretrained/sketchformer_tok_dict_init.safetensors \
-  --modes free-running \
-  --split valid
+  --experiment anime_tok_dict_long \
+  --checkpoint weights/pretrained/sketchformer_tok_dict_4096_init.safetensors \
+  --data-root data/processed/sketchformer-ready-data/tok-dict-4096 \
+  --codebook-path data/processed/sketch_token/codebook.npy \
+  --split valid --device cuda --precision 16-mixed \
+  --seed 42 --num-plots 50 --save-predictions --save-latents \
+  --output-dir evals/results --run-name baseline_valid
 ```
 
-### 3. TensorFlow-to-PyTorch Conversion Fidelity (`conversion_fidelity.py`)
+The default `--modes teacher-forced free-running` evaluates both modes. Either mode
+can be selected independently. Teacher-forced evaluation scores the model's shifted
+loss targets and mask. Comparable TF/FR per-sample accuracy excludes the supplied
+SOS and padding, includes EOS and separators, and counts missing generated tokens
+as incorrect. Global TF loss/accuracy are token-weighted; the per-sample accuracy
+means used by gap analysis give every sketch equal weight. Perplexity is the
+exponential of pooled token loss, not a mean of batch perplexities.
 
-Evaluates numerical parity between converted PyTorch model logits and reference
-TensorFlow outputs (global cosine similarity $\ge 0.999$, token argmax agreement $\ge 0.99$).
+Reports include all TF loss/accuracy/perplexity and FR accuracy/exact-match/EOS/F1
+metrics globally and per populated bucket. Empty buckets are absent, not silently
+reported as zero quality. Wall-clock timings include loading/metric computation and
+are **end-to-end evaluation times**, not isolated GPU kernel latency.
+
+The report records the checkpoint/codebook hashes, split-file hashes and dataset
+snapshot hash, resolved config hash, effective seed/precision, device, code revision,
+and peak CUDA memory when available. Only the requested split is loaded; no train
+split is needed to benchmark validation data. Seed zero is supported.
+
+Run artifacts are never overwritten: use a new `--run-name` for each experiment.
+An interrupted run may leave partial artifacts; preserve/inspect them and retry
+with a new run name. Archive the baseline artifacts and the exact code revision.
+
+### Frozen qualitative comparisons
+
+The comparison set is selected deterministically across populated length buckets,
+with spare capacity redistributed when a bucket has few samples. When fewer than
+50 samples exist, all available samples are selected. For subsequent models reuse
+exactly the saved IDs:
+
+```bash
+python evals/benchmark_eval.py \
+  --experiment anime_tok_dict_long \
+  --checkpoint weights/finetuned/sketchformer-tok-dict-anime-4096/best.pt \
+  --data-root data/processed/sketchformer-ready-data/tok-dict-4096 \
+  --codebook-path data/processed/sketch_token/codebook.npy \
+  --split valid --device cuda --precision 16-mixed --seed 42 \
+  --save-predictions --save-latents --num-plots 50 \
+  --comparison-manifest evals/results/baseline_valid_comparison_manifest.json \
+  --output-dir evals/results --run-name candidate_valid
+```
+
+The dataset snapshot must match; missing comparison IDs cause an error. Loader
+ordering and length bucketing cannot change the selected IDs or plot order.
+
+## 3. Diagnose the baseline
+
+```bash
+python evals/failure_analysis.py all \
+  --dataset-root data/processed/sketchformer-ready-data/tok-dict-4096 \
+  --codebook-path data/processed/sketch_token/codebook.npy --split valid \
+  --tf-report evals/results/baseline_valid_report.json \
+  --fr-per-sample evals/results/baseline_valid_per_sample.jsonl \
+  --predictions evals/results/baseline_valid_per_sample.jsonl \
+  --latent-vectors evals/results/baseline_valid_latents.npz \
+  --plots --output-dir evals/results/baseline_analysis
+```
+
+Individual commands are `gap`, `position-curves`, `separator-confusion`,
+`separators`, `codebook`, `quantization`, `latent-capacity`, `conversion`, and `plot`.
+Use `<command> --help` for required inputs. Position/cascade analysis needs the
+prediction arrays exported by `--save-predictions`; absent arrays cause an error.
+
+Gap analysis joins TF and FR by sample ID and verifies the target lengths/hashes
+and scoring convention. It reports per-sample gaps and ranks the worst 20 by
+TF-minus-FR accuracy, not geometry F1. A global TF score is never substituted for a
+missing bucket. Legacy reports with explicit matching bucket summaries can produce
+bucket-only analysis, clearly marked as lacking per-sample gaps.
+
+Missing continuation tokens count as errors in separator cascade windows. Counts
+are reported for both comparison groups. If either group is absent, the penalty
+and effect flag are `null`, since no comparison is supported. Position curves
+report the number of active target samples at each position.
+
+Latent export contains `embeddings`, `sample_ids`, `lengths`, `stroke_counts` and
+`tf_token_accuracy`, all in the same row order. Effective dimensionality is the
+covariance participation ratio: for singular values `s`, `(sum(s**2))**2 / sum(s**4)`.
+
+## 4. Verify conversion fidelity
+
+The comparison tool consumes outputs already exported from the original TensorFlow
+model and the converted PyTorch model. Generate both with identical inputs, sample
+order, token IDs, masks, decoding convention, and inference mode. The actual
+checkpoint converter is `scripts/sketchformer/convert_checkpoint.py`.
+
+For padded sequence logits, export each `.npz` with `logits` shaped `(B,T,V)` and a
+boolean `valid_mask` shaped `(B,T)`, or integer `lengths` shaped `(B,)`. Include only
+positions that both implementations are meant to predict; exclude padding and any
+supplied prefix. Both files' valid positions must agree if both supply metadata.
+Sequence exports without validity metadata are rejected. Genuinely unpadded
+position arrays may be exported as `(N,V)`.
 
 ```bash
 python evals/conversion_fidelity.py \
@@ -64,93 +161,30 @@ python evals/conversion_fidelity.py \
   --output-dir evals/results/conversion_fidelity
 ```
 
-### 4. Failure Analysis (`failure_analysis.py`)
+Alternatively pass `--valid-mask mask.npy` or `--lengths lengths.npy` explicitly.
+A comparison with zero valid positions, inconsistent masks, or nonfinite valid
+logits fails. The report records input file and mask hashes and evaluated positions.
+Thresholds default to cosine >= 0.999 and argmax agreement >= 0.99. A failed check
+returns a nonzero exit status, including through `failure_analysis.py conversion`
+and `failure_analysis.py all`.
 
-Diagnostic analysis suite for investigating model failure modes across all Phase 1 dimensions:
+## Outputs and follow-up study work
 
-```bash
-# Run all analyses and automatically generate publication figures
-python evals/failure_analysis.py all \
-  --dataset-root data/processed/sketchformer-ready-data/tok-dict \
-  --codebook-path data/processed/sketch_token/codebook.npy \
-  --split valid \
-  --plots \
-  --output-dir evals/results/analysis
+A complete `baseline_valid` run writes:
 
-# 1. TF vs FR gap analysis
-python evals/failure_analysis.py gap \
-  --tf-report evals/results/baseline_valid_report.json \
-  --fr-per-sample evals/results/baseline_valid_per_sample.jsonl
+- `baseline_valid_report.json`: provenance and global/per-bucket metrics.
+- `baseline_valid_teacher_forced_per_sample.jsonl`: TF scores and target identity.
+- `baseline_valid_per_sample.jsonl`: FR scores and optional target/predicted arrays.
+- `baseline_valid_comparison_manifest.json`: frozen stratified comparison IDs.
+- `baseline_valid_plots/`: numbered plots in the manifest's selection order.
+- `baseline_valid_latents.npz`: optional embeddings with aligned sample metadata.
 
-# 2. Position-accuracy curves (identifies onset <80% and collapse <50%)
-python evals/failure_analysis.py position-curves \
-  --predictions evals/results/baseline_valid_per_sample.jsonl
+`failure_analysis.py all --plots` produces diagnostic reports and available figures.
+Its optional analyses run only when their inputs are supplied; it does not generate
+TensorFlow reference outputs or missing latent/prediction files.
 
-# 3. Separator confusion & cascade effect (precision, recall, post-sep penalty)
-python evals/failure_analysis.py separator-confusion \
-  --predictions evals/results/baseline_valid_per_sample.jsonl
-
-# 4. Separator dataset distribution
-python evals/failure_analysis.py separators --split valid
-
-# 5. Codebook coverage & dead tokens
-python evals/failure_analysis.py codebook --split valid
-
-# 6. Quantization error & cumulative endpoint drift
-python evals/failure_analysis.py quantization \
-  --stroke5-dir data/processed/stroke5 \
-  --codebook-path data/processed/sketch_token/codebook.npy
-
-# 7. 128-dim latent bottleneck effective dimension & SVD spectrum
-python evals/failure_analysis.py latent-capacity \
-  --latent-vectors evals/results/validation_latents.npy
-
-# 8. Generate figures from an existing analysis directory
-python evals/failure_analysis.py plot \
-  --analysis-dir evals/results/analysis \
-  --output-dir evals/results/analysis/figures
-```
-
-### 5. Failure Analysis Visualizer (`visualize_failure_analysis.py`)
-
-Generates standalone publication-ready figures for reports and papers:
-
-```bash
-python evals/visualize_failure_analysis.py \
-  --analysis-dir evals/results/analysis \
-  --output-dir evals/results/analysis/figures
-```
-
-Generated plots:
-- `figure_position_accuracy_curves.png`: Sequence position vs token accuracy per bucket with Onset (80%) and Collapse (50%) thresholds
-- `figure_tf_vs_fr_gap.png`: Grouped bar chart comparing Teacher-Forced vs Free-Running accuracy with gap annotations
-- `figure_codebook_usage.png`: Active vs dead token donut chart and Zipfian log-log usage frequency curve
-- `figure_latent_capacity_scree.png`: Cumulative variance explained scree plot for the 128-dim bottleneck
-
-## Output Structure
-
-```
-evals/
-├── benchmark_manifest.jsonl          # Per-sample annotations
-├── benchmark_manifest_summary.json   # Dataset-level statistics
-└── results/
-    ├── baseline_valid_report.json    # Frozen baseline numbers + provenance
-    ├── baseline_valid_per_sample.jsonl  # Per-sample free-running records (+ predictions)
-    ├── baseline_valid_plots/         # 50 qualitative comparison visualizations
-    ├── conversion_fidelity/
-    │   └── conversion_fidelity_report.json
-    └── analysis/
-        ├── tf_vs_fr_gap_analysis.json
-        ├── position_accuracy_curves.json
-        ├── separator_confusion_analysis.json
-        ├── separator_analysis.json
-        ├── codebook_analysis.json
-        ├── codebook_usage_counts.npy
-        ├── quantization_analysis.json
-        ├── latent_capacity_analysis.json
-        └── figures/
-            ├── figure_position_accuracy_curves.png
-            ├── figure_tf_vs_fr_gap.png
-            ├── figure_codebook_usage.png
-            └── figure_latent_capacity_scree.png
-```
+The GPU study still needs actual baseline measurements, verified TensorFlow exports,
+per-sample quantization/reconstruction correlations, complexity-colored embedding
+visualizations, and a consolidated interpretation with Week 3 recommendations.
+The exported IDs/embeddings support that work. None of these empirical findings are
+claimed by CPU regression tests, and they must not be inferred from synthetic runs.

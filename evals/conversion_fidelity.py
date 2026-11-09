@@ -12,6 +12,7 @@ numerical parity:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from datetime import datetime, timezone
@@ -38,6 +39,7 @@ PROJECT_ROOT = _add_project_to_path()
 # Core Parity Metrics
 # ---------------------------------------------------------------------------
 
+
 def compute_parity_metrics(
     candidate_logits: torch.Tensor | np.ndarray,
     reference_logits: torch.Tensor | np.ndarray,
@@ -45,6 +47,8 @@ def compute_parity_metrics(
     min_cosine: float = 0.999,
     min_agreement: float = 0.99,
     top_k: int = 5,
+    valid_mask: torch.Tensor | np.ndarray | None = None,
+    lengths: torch.Tensor | np.ndarray | None = None,
 ) -> dict[str, Any]:
     """Compute parity metrics comparing candidate (PyTorch) vs reference (TF) logits.
 
@@ -65,8 +69,8 @@ def compute_parity_metrics(
     -------
     dict with parity metrics and pass/fail status.
     """
-    candidate = torch.as_tensor(candidate_logits, dtype=torch.float32)
-    reference = torch.as_tensor(reference_logits, dtype=torch.float32)
+    candidate = torch.as_tensor(candidate_logits, dtype=torch.float32).detach().cpu()
+    reference = torch.as_tensor(reference_logits, dtype=torch.float32).detach().cpu()
 
     if candidate.shape != reference.shape:
         raise ValueError(
@@ -80,9 +84,15 @@ def compute_parity_metrics(
             f"got shape {tuple(candidate.shape)}"
         )
 
-    # Flatten across batch and sequence dimensions: shape (-1, vocab_size)
-    cand_flat = candidate.reshape(-1, candidate.shape[-1])
-    ref_flat = reference.reshape(-1, reference.shape[-1])
+    if top_k < 1:
+        raise ValueError("top_k must be positive")
+    position_mask = _position_mask(candidate.shape[:-1], valid_mask, lengths)
+    cand_flat = candidate.reshape(-1, candidate.shape[-1])[position_mask.reshape(-1)]
+    ref_flat = reference.reshape(-1, reference.shape[-1])[position_mask.reshape(-1)]
+    if not cand_flat.numel():
+        raise ValueError("No valid logit positions to compare")
+    if not torch.isfinite(cand_flat).all() or not torch.isfinite(ref_flat).all():
+        raise ValueError("Valid logits must be finite")
     num_positions = cand_flat.shape[0]
     vocab_size = cand_flat.shape[1]
 
@@ -113,17 +123,16 @@ def compute_parity_metrics(
     abs_diff = torch.abs(cand_flat - ref_flat)
     max_abs_diff = float(abs_diff.max().item())
     mean_abs_diff = float(abs_diff.mean().item())
-    rms_diff = float(torch.sqrt(torch.mean(abs_diff ** 2)).item())
+    rms_diff = float(torch.sqrt(torch.mean(abs_diff**2)).item())
 
     # 6. Pass / Fail evaluation
-    passed = bool(
-        global_cosine >= min_cosine and argmax_agreement >= min_agreement
-    )
+    passed = bool(global_cosine >= min_cosine and argmax_agreement >= min_agreement)
 
     return {
         "status": "PASS" if passed else "FAIL",
         "num_positions_evaluated": num_positions,
         "vocab_size": vocab_size,
+        "masked_positions": int(position_mask.numel() - position_mask.sum()),
         "metrics": {
             "global_cosine_similarity": round(global_cosine, 6),
             "mean_position_cosine": round(mean_pos_cosine, 6),
@@ -147,6 +156,39 @@ def compute_parity_metrics(
 # File and NPZ Evaluation
 # ---------------------------------------------------------------------------
 
+
+def _position_mask(shape, valid_mask=None, lengths=None) -> torch.Tensor:
+    if valid_mask is not None and lengths is not None:
+        raise ValueError("Provide a valid mask or lengths, not both")
+    if valid_mask is not None:
+        mask = torch.as_tensor(valid_mask)
+        if tuple(mask.shape) != tuple(shape) or mask.dtype != torch.bool:
+            raise ValueError(f"valid_mask must be boolean with shape {tuple(shape)}")
+        return mask.cpu()
+    if lengths is not None:
+        values = torch.as_tensor(lengths)
+        if len(shape) != 2 or tuple(values.shape) != (shape[0],):
+            raise ValueError("lengths requires logits (B, T, V) and lengths (B,)")
+        if values.dtype == torch.bool or values.is_floating_point():
+            raise ValueError("lengths must contain integers")
+        if (values < 0).any() or (values > shape[1]).any():
+            raise ValueError("lengths must be between zero and sequence width")
+        return torch.arange(shape[1])[None, :] < values.cpu()[:, None]
+    # Unmasked arrays are explicitly interpreted as already unpadded positions.
+    return torch.ones(tuple(shape), dtype=torch.bool)
+
+
+def _exported_mask(path: Path, shape) -> torch.Tensor | None:
+    if path.suffix != ".npz":
+        return None
+    with np.load(path) as arrays:
+        if "valid_mask" in arrays:
+            return _position_mask(shape, valid_mask=arrays["valid_mask"])
+        if "lengths" in arrays:
+            return _position_mask(shape, lengths=arrays["lengths"])
+    return None
+
+
 def evaluate_logits_files(
     candidate_path: Path,
     reference_path: Path,
@@ -154,36 +196,79 @@ def evaluate_logits_files(
     *,
     min_cosine: float = 0.999,
     min_agreement: float = 0.99,
+    valid_mask_path: Path | None = None,
+    lengths_path: Path | None = None,
 ) -> dict[str, Any]:
-    """Compare candidate and reference logit arrays loaded from .npz or .npy."""
-    candidate_path = Path(candidate_path)
-    reference_path = Path(reference_path)
-
-    cand_array = _load_array(candidate_path)
-    ref_array = _load_array(reference_path)
-
+    """Compare shared-input exports, honoring embedded or explicitly supplied masks."""
+    candidate_path, reference_path = Path(candidate_path), Path(reference_path)
+    candidate, reference = _load_array(candidate_path), _load_array(reference_path)
+    if valid_mask_path is not None and lengths_path is not None:
+        raise ValueError("Provide --valid-mask or --lengths, not both")
+    mask = None
+    validity_source = "all positions; exports must be unpadded"
+    if valid_mask_path is not None:
+        mask = _position_mask(
+            candidate.shape[:-1], valid_mask=_load_array(Path(valid_mask_path))
+        )
+        validity_source = str(valid_mask_path)
+    elif lengths_path is not None:
+        mask = _position_mask(
+            candidate.shape[:-1], lengths=_load_array(Path(lengths_path))
+        )
+        validity_source = str(lengths_path)
+    else:
+        cand_mask = _exported_mask(candidate_path, candidate.shape[:-1])
+        ref_mask = _exported_mask(reference_path, reference.shape[:-1])
+        if (
+            cand_mask is not None
+            and ref_mask is not None
+            and not torch.equal(cand_mask, ref_mask)
+        ):
+            raise ValueError(
+                "Candidate/reference valid positions differ; export identical inputs"
+            )
+        mask = cand_mask if cand_mask is not None else ref_mask
+        if mask is not None:
+            validity_source = "embedded valid_mask/lengths"
+    if candidate.ndim >= 3 and mask is None:
+        raise ValueError(
+            "Sequence logit exports require valid_mask or lengths; export genuinely unpadded positions as a 2D (N,V) array"
+        )
     results = compute_parity_metrics(
-        cand_array,
-        ref_array,
+        candidate,
+        reference,
         min_cosine=min_cosine,
         min_agreement=min_agreement,
+        valid_mask=mask,
     )
-
     report = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "candidate_file": str(candidate_path),
         "reference_file": str(reference_path),
+        "candidate_sha256": _file_hash(candidate_path),
+        "reference_sha256": _file_hash(reference_path),
+        "validity_source": validity_source,
         **results,
     }
-
+    if mask is not None:
+        report["valid_mask_sha256"] = hashlib.sha256(mask.numpy().tobytes()).hexdigest()
     if output_dir:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         report_path = output_dir / "conversion_fidelity_report.json"
-        report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        report_path.write_text(
+            json.dumps(report, indent=2, allow_nan=False), encoding="utf-8"
+        )
         print(f"[conversion_fidelity] saved report to {report_path}")
-
     return report
+
+
+def _file_hash(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _load_array(path: Path) -> np.ndarray:
@@ -193,10 +278,14 @@ def _load_array(path: Path) -> np.ndarray:
 
     if path.suffix == ".npz":
         with np.load(path) as data:
-            for key in ("logits", "token_logits", "arr_0", data.files[0]):
+            for key in ("logits", "token_logits", "arr_0") + (
+                tuple(data.files) if len(data.files) == 1 else ()
+            ):
                 if key in data:
                     return np.asarray(data[key], dtype=np.float32)
-            raise ValueError(f"No suitable logit array found in {path}. Keys: {data.files}")
+            raise ValueError(
+                f"No suitable logit array found in {path}. Keys: {data.files}"
+            )
     else:
         return np.load(path)
 
@@ -204,6 +293,7 @@ def _load_array(path: Path) -> np.ndarray:
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -239,6 +329,15 @@ def parse_args() -> argparse.Namespace:
         default=0.99,
         help="Minimum argmax token agreement threshold (default: 0.99).",
     )
+    validity = parser.add_mutually_exclusive_group()
+    validity.add_argument(
+        "--valid-mask", type=Path, help="Boolean mask of valid logit positions (.npy)"
+    )
+    validity.add_argument(
+        "--lengths",
+        type=Path,
+        help="Integer sequence lengths for padded (B,T,V) exports (.npy)",
+    )
     return parser.parse_args()
 
 
@@ -252,6 +351,8 @@ def main() -> int:
             output_dir=args.output_dir,
             min_cosine=args.min_cosine,
             min_agreement=args.min_agreement,
+            valid_mask_path=args.valid_mask,
+            lengths_path=args.lengths,
         )
         status = report["status"]
         cosine = report["metrics"]["global_cosine_similarity"]
@@ -261,10 +362,11 @@ def main() -> int:
         print(f"  Argmax Agreement : {agreement:.6f} (target >= {args.min_agreement})")
         return 0 if status == "PASS" else 1
 
-    print("[conversion_fidelity] Error: Please provide both --candidate-logits and --reference-logits.")
+    print(
+        "[conversion_fidelity] Error: Please provide both --candidate-logits and --reference-logits."
+    )
     return 1
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -30,24 +31,29 @@ PROJECT_ROOT = _add_project_to_path()
 import numpy as np
 import torch
 
+from evals.benchmark_common import (
+    ACCURACY_DEFINITION,
+    LENGTH_DEFINITION,
+    length_bucket,
+    length_bucket_range,
+    records_by_id,
+    sample_metadata,
+    sample_rank,
+    select_comparison_samples,
+)
 from builders import build_loss, build_model, maybe_compile_model
 from builders.config_utils import get_nested
-from core import average_logs, load_checkpoint, move_to_device
-from core.metrics import reconstruction_metrics
+from core import move_to_device
 from dataloaders import StrokeSequenceDataModule
 from metrics.sketchformer.free_running import (
-    aggregate_free_running_records,
     free_running_reconstruction_records,
 )
 from metrics.sketchformer.reconstruction import (
     collect_generated_reconstruction_examples,
-    collect_reconstruction_examples,
-    write_metrics_report,
 )
 from prep_data.sketch_token.create_token_dict import load_codebook_from_dir
 from scripts.sketchformer.config import (
     compose_training_config,
-    format_logs,
     limited,
     parse_batch_limit,
     resolve_device,
@@ -74,7 +80,9 @@ def _config_hash(config: dict[str, Any]) -> str:
     return hashlib.sha256(config_str.encode()).hexdigest()[:16]
 
 
-def _load_model_checkpoint(path: Path, model: torch.nn.Module, strict: bool = False) -> None:
+def _load_model_checkpoint(
+    path: Path, model: torch.nn.Module, strict: bool = True
+) -> dict[str, Any]:
     """Load model weights supporting both .safetensors and torch checkpoints."""
     if path.suffix == ".safetensors":
         from safetensors.torch import load_file
@@ -83,10 +91,21 @@ def _load_model_checkpoint(path: Path, model: torch.nn.Module, strict: bool = Fa
     else:
         checkpoint = torch.load(path, map_location="cpu")
         if isinstance(checkpoint, dict):
-            state_dict = checkpoint.get("model", checkpoint.get("state_dict", checkpoint))
+            state_dict = checkpoint.get(
+                "model", checkpoint.get("state_dict", checkpoint)
+            )
         else:
             state_dict = checkpoint
-    model.load_state_dict(state_dict, strict=strict)
+    if not isinstance(state_dict, dict) or not (
+        model.state_dict().keys() & state_dict.keys()
+    ):
+        raise ValueError("Checkpoint contains no matching model weights")
+    incompatible = model.load_state_dict(state_dict, strict=strict)
+    return {
+        "strict": strict,
+        "missing_keys": list(incompatible.missing_keys),
+        "unexpected_keys": list(incompatible.unexpected_keys),
+    }
 
 
 def _load_codebook(config: dict[str, Any]) -> np.ndarray:
@@ -107,6 +126,41 @@ def _load_codebook(config: dict[str, Any]) -> np.ndarray:
     )
 
 
+def _annotate_record(
+    batch: dict[str, Any], row: int, sep_token_id: int = 1001
+) -> dict[str, Any]:
+    length = int(batch["lengths"][row])
+    tokens = batch["targets"][row, :length].detach().cpu().numpy().astype(np.int64)
+    return {
+        **sample_metadata(batch, row),
+        "target_length": length,
+        "length_bucket": length_bucket(length),
+        "length_bucket_range": length_bucket_range(length),
+        "target_sha256": hashlib.sha256(tokens.tobytes()).hexdigest(),
+        "accuracy_definition": ACCURACY_DEFINITION,
+        "stroke_count": int(np.sum(tokens == sep_token_id))
+        + int(len(tokens) > 2 and tokens[-2] != sep_token_id),
+    }
+
+
+def _tf_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
+    count = sum(r["tf_scored_tokens"] for r in records)
+    loss = sum(r["tf_token_loss_sum"] for r in records) / count
+    return {
+        "count": len(records),
+        "valid_tokens": count,
+        "tf_token_loss": loss,
+        "tf_token_perplexity": float(np.exp(min(loss, 50.0))),
+        "tf_token_accuracy": sum(r["tf_correct_tokens"] for r in records) / count,
+        "tf_token_accuracy_mean": float(
+            np.mean([r["tf_token_accuracy"] for r in records])
+        ),
+        "tf_token_accuracy_median": float(
+            np.median([r["tf_token_accuracy"] for r in records])
+        ),
+    }
+
+
 def run_teacher_forced(
     model: torch.nn.Module,
     loss_fn: torch.nn.Module,
@@ -116,75 +170,104 @@ def run_teacher_forced(
     *,
     limit_batches: float | int = 1.0,
     split: str = "valid",
+    sos_token_id: int = 1002,
+    sep_token_id: int = 1001,
+    save_latents: bool = False,
 ) -> dict[str, Any]:
-    """Run teacher-forced evaluation and return aggregated metrics."""
-    logs: list[dict[str, torch.Tensor]] = []
+    """Score shifted loss targets and retain comparable per-sample measurements."""
     model.eval()
-    total_samples = 0
+    records: list[dict[str, Any]] = []
+    latents: list[np.ndarray] = []
     start_time = time.perf_counter()
-    bucket_accs: dict[str, list[float]] = {}
-
     with torch.no_grad():
         for batch in limited(loader, limit_batches):
             batch = move_to_device(batch, device)
             with _autocast_context(device, precision):
                 output = model(batch)
-                loss_output = loss_fn(output, batch)
-                metric_output = reconstruction_metrics(output, batch)
-                step_logs = loss_output.as_log_dict(prefix=split)
-                step_logs.update(metric_output.as_log_dict(prefix=split))
-            logs.append(step_logs)
-            batch_size = batch["targets"].shape[0]
-            total_samples += batch_size
-
-            # Per-bucket accuracy collection
-            token_logits = getattr(getattr(output, "reconstruction", None), "token_logits", None)
-            if token_logits is not None:
-                targets = batch["targets"].to(device=token_logits.device, dtype=torch.long)
-                valid_mask = batch.get("valid_mask")
-                if valid_mask is None:
-                    valid_mask = torch.ones(targets.shape[:2], dtype=torch.bool, device=targets.device)
-                else:
-                    valid_mask = valid_mask.to(device=targets.device, dtype=torch.bool)
-                preds = torch.argmax(token_logits, dim=-1)
-                matches = (preds == targets) & valid_mask
-                lengths = batch.get("lengths")
-                from evals.benchmark_manifest import length_bucket
-                for row_i in range(batch_size):
-                    row_mask = valid_mask[row_i]
-                    if row_mask.sum() > 0:
-                        row_acc = float(matches[row_i][row_mask].float().mean().item())
-                        row_len = int(lengths[row_i]) if lengths is not None else int(row_mask.sum().item())
-                        b = length_bucket(row_len)
-                        bucket_accs.setdefault(b, []).append(row_acc)
-
+                loss_fn(
+                    output, batch
+                )  # Exercise the configured reconstruction objective.
+            logits = output.reconstruction.token_logits.float()
+            targets = (
+                output.loss_targets
+                if output.loss_targets is not None
+                else batch["targets"]
+            )
+            mask = (
+                output.loss_valid_mask
+                if output.loss_valid_mask is not None
+                else batch["valid_mask"]
+            )
+            mask = mask.bool() & (targets != sos_token_id)
+            losses = torch.nn.functional.cross_entropy(
+                logits.reshape(-1, logits.shape[-1]),
+                targets.reshape(-1),
+                reduction="none",
+            ).reshape_as(targets)
+            matches = logits.argmax(-1) == targets
+            for row in range(targets.shape[0]):
+                row_mask = mask[row]
+                count = int(row_mask.sum())
+                if not count:
+                    raise ValueError("Benchmark sample has no scorable target tokens")
+                loss_sum = float(losses[row][row_mask].sum())
+                correct = int(matches[row][row_mask].sum())
+                records.append(
+                    {
+                        **_annotate_record(batch, row, sep_token_id),
+                        "tf_scored_tokens": count,
+                        "tf_correct_tokens": correct,
+                        "tf_token_loss_sum": loss_sum,
+                        "tf_token_loss": loss_sum / count,
+                        "tf_token_accuracy": correct / count,
+                    }
+                )
+            if save_latents:
+                latents.append(output.embedding.detach().float().cpu().numpy())
+    if not records:
+        raise ValueError("Teacher-forced benchmark evaluated zero samples")
+    records_by_id(records)
+    per_bucket = {
+        bucket: _tf_summary([r for r in records if r["length_bucket"] == bucket])
+        for bucket in sorted({r["length_bucket"] for r in records})
+    }
+    summary = _tf_summary(records)
     elapsed = time.perf_counter() - start_time
-    weight_key = f"{split}/valid_tokens"
-    summary = average_logs(
-        logs,
-        weight_key=weight_key if logs and weight_key in logs[0] else None,
-    )
-
-    # Collect per-bucket metrics if per-sample bucket accuracies exist
-    per_bucket: dict[str, dict[str, Any]] = {}
-    if bucket_accs:
-        for b, acc_list in sorted(bucket_accs.items()):
-            per_bucket[b] = {
-                "count": len(acc_list),
-                "tf_token_accuracy_mean": round(float(np.mean(acc_list)), 4),
-                "tf_token_accuracy_median": round(float(np.median(acc_list)), 4),
-            }
-
-    return {
+    result = {
         "mode": "teacher-forced",
-        "total_samples": total_samples,
-        "wall_clock_seconds": round(elapsed, 2),
-        "seconds_per_sample": round(elapsed / max(total_samples, 1), 4),
+        "total_samples": len(records),
+        "wall_clock_seconds": elapsed,
+        "seconds_per_sample": elapsed / len(records),
         "metrics": {
-            key: round(float(value), 6) for key, value in summary.items()
+            f"{split}/token_loss": summary["tf_token_loss"],
+            f"{split}/token_accuracy": summary["tf_token_accuracy"],
+            f"{split}/token_perplexity": summary["tf_token_perplexity"],
+            f"{split}/token_accuracy_mean": summary["tf_token_accuracy_mean"],
+            f"{split}/valid_tokens": summary["valid_tokens"],
         },
         "per_bucket": per_bucket,
+        "per_sample_records": records,
     }
+    if save_latents:
+        result["latent_vectors"] = np.concatenate(latents)
+    return result
+
+
+def _fr_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
+    result = {"count": len(records)}
+    for name in (
+        "token_accuracy",
+        "exact_match",
+        "eos_rate",
+        "max_length_hit",
+        "geometry_f1_2px",
+    ):
+        result["fr_" + name] = float(np.mean([r[name] for r in records]))
+    result["fr_token_accuracy_mean"] = result["fr_token_accuracy"]
+    result["fr_geometry_f1_2px_median"] = float(
+        np.median([r["geometry_f1_2px"] for r in records])
+    )
+    return result
 
 
 def run_free_running(
@@ -200,83 +283,119 @@ def run_free_running(
     max_generation_length: int | None = None,
     num_plots: int = 50,
     save_predictions: bool = False,
+    sos_token_id: int = 1002,
+    pad_token_id: int = 0,
+    sep_token_id: int = 1001,
+    seed: int = 42,
+    comparison_ids: list[str] | None = None,
 ) -> tuple[dict[str, Any], list[Any]]:
-    """Run free-running evaluation and return metrics + reconstruction examples."""
+    """Score complete generations and choose stable, stratified qualitative samples."""
     model.eval()
-    all_records: list[dict[str, float | int | str]] = []
-    examples: list[Any] = []
-    total_samples = 0
-    start_time = time.perf_counter()
-
-    # Access the raw model for generate() (unwrap compiled model if needed)
     raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
-
+    all_records: list[dict[str, Any]] = []
+    candidates: dict[str, Any] = {}
+    requested = set(comparison_ids) if comparison_ids is not None else None
+    start_time = time.perf_counter()
     with torch.no_grad():
         for batch in limited(loader, limit_batches):
             batch = move_to_device(batch, device)
             with _autocast_context(device, precision):
                 generation = raw_model.generate(
-                    batch,
-                    max_length=max_generation_length,
-                    use_cache=True,
+                    batch, max_length=max_generation_length, use_cache=True
                 )
-                batch_records = free_running_reconstruction_records(
-                    generation.tokens,
-                    generation.lengths,
-                    batch,
-                    codebook,
-                    eos_token_id=eos_token_id,
+            batch_records = free_running_reconstruction_records(
+                generation.tokens,
+                generation.lengths,
+                batch,
+                codebook,
+                eos_token_id=eos_token_id,
+            )
+            targets = batch["targets"].detach().cpu()
+            predictions = generation.tokens.detach().cpu()
+            for row, record in enumerate(batch_records):
+                target = targets[row, : int(batch["lengths"][row])].numpy()
+                pred = predictions[row, : int(generation.lengths[row])].numpy()
+                aligned = np.full(len(target), -1, dtype=np.int64)
+                overlap = min(len(target), len(pred))
+                aligned[:overlap] = pred[:overlap]
+                mask = (target != sos_token_id) & (target != pad_token_id)
+                if not mask.any():
+                    raise ValueError("Benchmark sample has no scorable target tokens")
+                record.update(_annotate_record(batch, row, sep_token_id))
+                record["token_accuracy"] = float(np.mean((target == aligned)[mask]))
+                generation_limit = (
+                    max_generation_length
+                    if max_generation_length is not None
+                    else int(batch["lengths"].max())
+                )
+                record["max_length_hit"] = float(
+                    not record["eos_rate"] and len(pred) >= generation_limit
                 )
                 if save_predictions:
-                    targets = torch.as_tensor(batch["targets"]).detach().cpu()
-                    t_lens = torch.as_tensor(batch["lengths"]).detach().cpu().long()
-                    preds = generation.tokens.detach().cpu().long()
-                    p_lens = generation.lengths.detach().cpu().long()
-                    for idx, rec in enumerate(batch_records):
-                        rec["target_tokens"] = targets[idx, : t_lens[idx]].tolist()
-                        rec["predicted_tokens"] = preds[idx, : p_lens[idx]].tolist()
-                # Attach sample metadata to records
-                sample_ids = batch.get("sample_ids")
-                source_files = batch.get("source_files")
-                source_indices = batch.get("source_indices")
-                for idx, rec in enumerate(batch_records):
-                    if sample_ids is not None and idx < len(sample_ids):
-                        rec["sample_id"] = str(sample_ids[idx])
-                    if source_files is not None and idx < len(source_files):
-                        rec["source_file"] = str(source_files[idx])
-                    if source_indices is not None and idx < len(source_indices):
-                        rec["source_index"] = int(source_indices[idx])
-
-                all_records.extend(batch_records)
-
-            batch_size = batch["targets"].shape[0]
-            total_samples += batch_size
-
-            # Collect comparison examples
-            remaining = num_plots - len(examples)
-            if remaining > 0:
-                examples.extend(
-                    collect_generated_reconstruction_examples(
-                        generation,
-                        batch,
-                        max_examples=remaining,
-                        codebook=codebook,
-                    )
-                )
-
+                    record["target_tokens"] = target.tolist()
+                    record["predicted_tokens"] = pred.tolist()
+                all_records.append(record)
+            if num_plots:
+                for example in collect_generated_reconstruction_examples(
+                    generation,
+                    batch,
+                    max_examples=targets.shape[0],
+                    codebook=codebook,
+                ):
+                    key = str(example.sample_id)
+                    if requested is None or key in requested:
+                        candidates[key] = example
+                # Bound memory to at most num_plots candidates in each bucket.
+                if requested is None:
+                    for bucket in {
+                        length_bucket(e.length) for e in candidates.values()
+                    }:
+                        keys = sorted(
+                            (
+                                k
+                                for k, e in candidates.items()
+                                if length_bucket(e.length) == bucket
+                            ),
+                            key=lambda k: sample_rank(k, seed),
+                        )
+                        for key in keys[num_plots:]:
+                            del candidates[key]
+    if not all_records:
+        raise ValueError("Free-running benchmark evaluated zero samples")
+    by_id = records_by_id(all_records)
+    if comparison_ids is None:
+        selection = select_comparison_samples(all_records, num_plots, seed)
+    else:
+        if len(requested) != len(comparison_ids):
+            raise ValueError("Comparison manifest contains duplicate sample IDs")
+        if not requested <= by_id.keys():
+            raise ValueError(
+                "Comparison manifest includes samples absent from this evaluation"
+            )
+        selection = [
+            {k: by_id[key][k] for k in ("sample_id", "length_bucket", "target_length")}
+            for key in comparison_ids
+        ]
+    examples = [candidates[r["sample_id"]] for r in selection]
+    summary = _fr_summary(all_records)
     elapsed = time.perf_counter() - start_time
-    free_summary = aggregate_free_running_records(all_records, device=device)
-
+    metrics = {
+        f"{split}/free_running/{k[3:]}": v
+        for k, v in summary.items()
+        if k.startswith("fr_")
+    }
     return {
         "mode": "free-running",
-        "total_samples": total_samples,
-        "wall_clock_seconds": round(elapsed, 2),
-        "seconds_per_sample": round(elapsed / max(total_samples, 1), 4),
-        "metrics": {
-            f"{split}/{key}": round(float(value), 6)
-            for key, value in free_summary.items()
+        "total_samples": len(all_records),
+        "wall_clock_seconds": elapsed,
+        "seconds_per_sample": elapsed / len(all_records),
+        "metrics": metrics,
+        "per_bucket": {
+            b: _fr_summary([r for r in all_records if r["length_bucket"] == b])
+            for b in sorted({r["length_bucket"] for r in all_records})
         },
         "per_sample_records": all_records,
+        "comparison_samples": selection,
     }, examples
 
 
@@ -287,8 +406,14 @@ def build_provenance(
     seed: int | None = None,
 ) -> dict[str, Any]:
     """Build a provenance block for full reproducibility."""
-    effective_seed = seed if seed is not None else (
-        args.seed if getattr(args, "seed", None) is not None else int(config.get("project", {}).get("seed", 42))
+    effective_seed = (
+        seed
+        if seed is not None
+        else (
+            args.seed
+            if getattr(args, "seed", None) is not None
+            else int(config.get("project", {}).get("seed", 42))
+        )
     )
     provenance: dict[str, Any] = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -308,13 +433,30 @@ def build_provenance(
         if ckpt_path.exists():
             provenance["checkpoint_sha256"] = _file_sha256(ckpt_path)
 
-    # GPU info
-    if torch.cuda.is_available():
-        provenance["gpu"] = torch.cuda.get_device_name(0)
+    # GPU info for the actual selected device.
+    selected_device = resolve_device(getattr(args, "device", "auto"))
+    if selected_device.type == "cuda":
+        provenance["gpu"] = torch.cuda.get_device_name(selected_device)
         provenance["gpu_memory_total_mb"] = round(
-            torch.cuda.get_device_properties(0).total_mem / 1024 / 1024, 0
+            torch.cuda.get_device_properties(selected_device).total_mem / 1024 / 1024, 0
         )
 
+    provenance["experiment"] = config.get("experiment", {}).get("name", args.experiment)
+    revision = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=PROJECT_ROOT, text=True, capture_output=True
+    )
+    provenance["git_commit"] = (
+        revision.stdout.strip() if revision.returncode == 0 else None
+    )
+    status = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=PROJECT_ROOT,
+        text=True,
+        capture_output=True,
+    )
+    provenance["git_dirty"] = (
+        bool(status.stdout.strip()) if status.returncode == 0 else None
+    )
     return provenance
 
 
@@ -329,6 +471,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--split", choices=["valid", "test"], default="valid")
     parser.add_argument("--data-root", default=None)
+    parser.add_argument(
+        "--codebook-path",
+        type=Path,
+        help="Override the codebook location without changing its token layout",
+    )
     parser.add_argument("--device", default="auto")
     parser.add_argument("--precision", default=None)
     parser.add_argument("--limit-batches", type=parse_batch_limit, default=1.0)
@@ -362,84 +509,206 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override the random seed for reproducibility.",
     )
+    parser.add_argument(
+        "--save-latents",
+        action="store_true",
+        help="Save per-sample encoder embeddings during teacher-forced evaluation.",
+    )
+    parser.add_argument(
+        "--comparison-manifest",
+        type=Path,
+        help="Reuse a previously frozen stratified plot sample set.",
+    )
+    parser.add_argument(
+        "--allow-random-init",
+        action="store_true",
+        help="Allow synthetic smoke tests without a checkpoint.",
+    )
+    parser.add_argument(
+        "--allow-partial-checkpoint",
+        action="store_true",
+        help="Allow incomplete weights, recording all missing/unexpected keys in provenance.",
+    )
     return parser.parse_args()
+
+
+def _prepare_loader(config: dict[str, Any], split: str, seed: int):
+    sequence = config["data"]["sequence"]
+    sequence["truncate_long_sequences"] = False
+    sequence["add_start_token"] = True
+    sequence["add_end_token"] = True
+    capacity = int(config["model"]["input"]["max_seq_len"])
+    if int(sequence["max_length"]) > capacity:
+        raise ValueError(
+            "Dataset sequence limit exceeds model capacity; choose a compatible experiment/checkpoint"
+        )
+    datamodule = StrokeSequenceDataModule(
+        config["data"], project_root=PROJECT_ROOT, seed=seed
+    )
+    # Load only the requested split; evaluation must not require training/test data.
+    dataset = datamodule._make_dataset(split)
+    dataset.transform = BenchmarkTokenTransform(
+        dataset.transform,
+        int(config["data"]["format"]["token_dictionary"]["pad_token_id"]),
+    )
+    for index in range(len(dataset)):
+        try:
+            dataset[index]
+        except ValueError as exc:
+            raise ValueError(
+                f"Unsupported sample {dataset.index[index].sample_id}: {exc}. "
+                "Benchmark truncation is disabled. Use a longer-sequence compatible experiment/checkpoint."
+            ) from exc
+    if split == "valid":
+        datamodule.valid_dataset = dataset
+        return datamodule.val_dataloader()
+    datamodule.test_dataset = dataset
+    return datamodule.test_dataloader()
+
+
+class BenchmarkTokenTransform:
+    """Remove storage padding before the existing non-truncating token transform."""
+
+    def __init__(self, transform, pad_token_id):
+        self.transform = transform
+        self.pad_token_id = pad_token_id
+
+    def __call__(self, sample):
+        sample = dict(sample)
+        tokens = np.asarray(sample["tokens"])
+        sample["tokens"] = tokens[tokens != self.pad_token_id]
+        return self.transform(sample)
+
+
+def _write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
+    with path.open("w", encoding="utf-8") as stream:
+        for record in records:
+            stream.write(json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n")
 
 
 def main() -> int:
     args = parse_args()
+    if args.num_plots < 0 or args.limit_batches <= 0:
+        raise ValueError(
+            "num_plots must be nonnegative and limit_batches must be positive"
+        )
+    if not args.checkpoint and not args.allow_random_init:
+        raise ValueError(
+            "Provide --checkpoint; --allow-random-init is for synthetic smoke tests only"
+        )
+    if args.save_latents and "teacher-forced" not in args.modes:
+        raise ValueError("--save-latents requires teacher-forced mode")
+    if args.comparison_manifest and (
+        "free-running" not in args.modes or args.num_plots == 0
+    ):
+        raise ValueError(
+            "--comparison-manifest requires free-running mode and num_plots > 0"
+        )
     config = compose_training_config(args.config, experiment=args.experiment)
+    if config["data"]["format"]["type"] not in {"tok_dict", "token", "tokens"}:
+        raise ValueError("This benchmark requires tok-dict reconstruction data")
     if args.data_root:
         config["data"]["dataset"]["root"] = args.data_root
-    if args.precision:
-        config.setdefault("trainer", {}).setdefault("runtime", {})["precision"] = (
-            args.precision
+    if args.codebook_path:
+        config["data"]["format"]["token_dictionary"]["codebook_dir"] = None
+        config["data"]["format"]["token_dictionary"]["codebook_path"] = str(
+            args.codebook_path.resolve()
         )
-
-    # Seed for reproducibility
-    seed = args.seed or int(config.get("project", {}).get("seed", 42))
+    if args.precision:
+        config["trainer"]["runtime"]["precision"] = args.precision
+    seed = (
+        args.seed
+        if args.seed is not None
+        else int(config.get("project", {}).get("seed", 42))
+    )
+    config.setdefault("project", {})["seed"] = seed
     torch.manual_seed(seed)
     np.random.seed(seed)
-
     device = resolve_device(args.device)
     _configure_torch_runtime(config, device)
     precision = _resolve_precision_runtime(config, device)
-
-    # Data
-    datamodule = StrokeSequenceDataModule(config["data"], project_root=PROJECT_ROOT)
-    datamodule.setup("test" if args.split == "test" else "fit")
-    loader = (
-        datamodule.test_dataloader()
-        if args.split == "test"
-        else datamodule.val_dataloader()
-    )
-
-    # Model
-    raw_model = build_model(config["model"])
-    if args.checkpoint:
-        ckpt_path = Path(args.checkpoint)
-        if not ckpt_path.is_absolute():
-            ckpt_path = PROJECT_ROOT / ckpt_path
-        _load_model_checkpoint(ckpt_path, raw_model, strict=False)
-        print(f"[benchmark] loaded checkpoint: {args.checkpoint}")
-    else:
-        print(
-            "[warning] evaluating randomly initialized model; "
-            "pass --checkpoint for trained weights"
+    config["trainer"]["runtime"]["precision"] = precision.effective
+    capacity = int(config["model"]["input"]["max_seq_len"])
+    if (
+        args.max_generation_length is not None
+        and not 2 <= args.max_generation_length <= capacity
+    ):
+        raise ValueError(
+            f"max_generation_length must be between 2 and model capacity {capacity}"
         )
+    run_name = args.run_name or f"benchmark_{args.split}"
+    if Path(run_name).name != run_name or run_name in {".", ".."}:
+        raise ValueError("run_name must be a filename, without directory components")
+    output_dir = PROJECT_ROOT / args.output_dir
+    report_path = output_dir / f"{run_name}_report.json"
+    if output_dir.exists() and any(
+        p.name.startswith(run_name + "_") for p in output_dir.iterdir()
+    ):
+        raise FileExistsError(
+            f"Run artifacts already exist for {run_name}; choose a new --run-name to preserve the baseline"
+        )
+    loader = _prepare_loader(config, args.split, seed)
+    raw_model = build_model(config["model"])
+    checkpoint_load = None
+    if args.checkpoint:
+        checkpoint_load = _load_model_checkpoint(
+            PROJECT_ROOT / args.checkpoint,
+            raw_model,
+            strict=not args.allow_partial_checkpoint,
+        )
+        print(f"[benchmark] loaded checkpoint: {args.checkpoint}")
     model = maybe_compile_model(raw_model.to(device), config["model"])
-
-    # Loss (for teacher-forced mode)
     loss_fn = build_loss(config["optimizer"]).to(device)
-
-    # Codebook (for free-running mode)
     codebook = None
     codebook_path = None
     if "free-running" in args.modes:
         codebook = _load_codebook(config)
-        raw_codebook_path = get_nested(
-            config, "data.format.token_dictionary.codebook_path"
+        expected = int(config["data"]["format"]["token_dictionary"]["codebook_size"])
+        if codebook.shape != (expected, 2) or not np.isfinite(codebook).all():
+            raise ValueError(
+                f"Codebook must contain {expected} finite two-dimensional vectors matching the model token layout"
+            )
+        directory = get_nested(config, "data.format.token_dictionary.codebook_dir")
+        codebook_path = PROJECT_ROOT / (
+            str(Path(directory) / "codebook.npy")
+            if directory
+            else get_nested(config, "data.format.token_dictionary.codebook_path")
         )
-        if raw_codebook_path:
-            codebook_path = PROJECT_ROOT / raw_codebook_path
-
-    # Output setup
-    run_name = args.run_name or f"benchmark_{args.split}"
-    output_dir = PROJECT_ROOT / args.output_dir
+    provenance = build_provenance(args, config, codebook_path, seed=seed)
+    provenance.update(
+        {
+            "length_definition": LENGTH_DEFINITION,
+            "accuracy_definition": ACCURACY_DEFINITION,
+            "effective_precision": precision.effective,
+            "device": str(device),
+            "checkpoint_load": checkpoint_load,
+            "random_initialization": not bool(args.checkpoint),
+        }
+    )
+    files = sorted(loader.dataset.files)
+    provenance["dataset_files"] = {p.name: _file_sha256(p) for p in files}
+    provenance["dataset_sha256"] = hashlib.sha256(
+        json.dumps(provenance["dataset_files"], sort_keys=True).encode(),
+    ).hexdigest()
+    comparison_ids = None
+    selection_seed = seed
+    if args.comparison_manifest:
+        manifest = json.loads(Path(args.comparison_manifest).read_text())
+        if manifest.get("dataset_sha256") != provenance["dataset_sha256"]:
+            raise ValueError(
+                "Comparison manifest belongs to a different dataset snapshot"
+            )
+        if manifest.get("length_definition") != LENGTH_DEFINITION:
+            raise ValueError("Comparison manifest uses a different length definition")
+        comparison_ids = [row["sample_id"] for row in manifest["samples"]]
+        selection_seed = int(manifest["seed"])
+    report = {"schema_version": 2, "provenance": provenance}
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Build report
-    config.setdefault("project", {})["seed"] = seed
-    report: dict[str, Any] = {
-        "provenance": build_provenance(args, config, codebook_path, seed=seed),
-    }
-
-    # Track peak GPU memory
-    if torch.cuda.is_available():
-        torch.cuda.reset_peak_memory_stats()
-
-    # --- Teacher-forced evaluation ---
+    tf_records = []
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
     if "teacher-forced" in args.modes:
-        print("\n[benchmark] Running teacher-forced evaluation...")
+        print("[benchmark] Running teacher-forced evaluation...")
         tf_results = run_teacher_forced(
             model,
             loss_fn,
@@ -448,17 +717,36 @@ def main() -> int:
             precision,
             limit_batches=args.limit_batches,
             split=args.split,
+            sos_token_id=int(
+                config["data"]["format"]["token_dictionary"]["sos_token_id"]
+            ),
+            sep_token_id=int(
+                config["data"]["format"]["token_dictionary"]["sep_token_id"]
+            ),
+            save_latents=args.save_latents,
         )
+        tf_records = tf_results.pop("per_sample_records")
+        latent_vectors = tf_results.pop("latent_vectors", None)
+        tf_path = output_dir / f"{run_name}_teacher_forced_per_sample.jsonl"
+        _write_jsonl(tf_path, tf_records)
+        tf_results["per_sample_path"] = tf_path.name
         report["teacher_forced"] = tf_results
-        print(f"  → {tf_results['total_samples']} samples in {tf_results['wall_clock_seconds']}s")
-        for key, value in tf_results["metrics"].items():
-            print(f"  {key}: {value:.6f}")
-
-    # --- Free-running evaluation ---
+        if latent_vectors is not None:
+            latent_path = output_dir / f"{run_name}_latents.npz"
+            np.savez_compressed(
+                latent_path,
+                embeddings=latent_vectors,
+                sample_ids=np.array([r["sample_id"] for r in tf_records]),
+                lengths=np.array([r["target_length"] for r in tf_records]),
+                stroke_counts=np.array([r["stroke_count"] for r in tf_records]),
+                tf_token_accuracy=np.array(
+                    [r["tf_token_accuracy"] for r in tf_records]
+                ),
+            )
+            report["teacher_forced"]["latent_vectors_path"] = latent_path.name
     examples = []
     if "free-running" in args.modes:
-        assert codebook is not None
-        print("\n[benchmark] Running free-running evaluation...")
+        print("[benchmark] Running free-running evaluation...")
         fr_results, examples = run_free_running(
             model,
             loader,
@@ -466,52 +754,64 @@ def main() -> int:
             precision,
             codebook,
             eos_token_id=int(
-                get_nested(config, "data.format.token_dictionary.eos_token_id")
+                config["data"]["format"]["token_dictionary"]["eos_token_id"]
+            ),
+            sos_token_id=int(
+                config["data"]["format"]["token_dictionary"]["sos_token_id"]
+            ),
+            pad_token_id=int(
+                config["data"]["format"]["token_dictionary"]["pad_token_id"]
+            ),
+            sep_token_id=int(
+                config["data"]["format"]["token_dictionary"]["sep_token_id"]
             ),
             limit_batches=args.limit_batches,
             split=args.split,
             max_generation_length=args.max_generation_length,
             num_plots=args.num_plots,
             save_predictions=args.save_predictions,
+            seed=seed,
+            comparison_ids=comparison_ids,
         )
-        # Remove per-sample records from report (save separately)
-        per_sample = fr_results.pop("per_sample_records", [])
-        report["free_running"] = fr_results
-        print(f"  → {fr_results['total_samples']} samples in {fr_results['wall_clock_seconds']}s")
-        for key, value in fr_results["metrics"].items():
-            print(f"  {key}: {value:.6f}")
-
-        # Save per-sample records for failure analysis
+        per_sample = fr_results.pop("per_sample_records")
+        if (
+            tf_records
+            and records_by_id(tf_records).keys() != records_by_id(per_sample).keys()
+        ):
+            raise ValueError("TF and FR modes evaluated different samples")
         per_sample_path = output_dir / f"{run_name}_per_sample.jsonl"
-        with open(per_sample_path, "w", encoding="utf-8") as f:
-            for record in per_sample:
-                f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
-        print(f"\n[benchmark] wrote per-sample records to {per_sample_path}")
-
-    # GPU memory
-    if torch.cuda.is_available():
-        peak_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
-        report["provenance"]["peak_gpu_memory_mb"] = round(peak_mb, 1)
-
-    # Save report
-    report_path = output_dir / f"{run_name}_report.json"
-    report_path.write_text(
-        json.dumps(report, indent=2, ensure_ascii=False, default=str),
-        encoding="utf-8",
-    )
-    print(f"\n[benchmark] wrote report to {report_path}")
-
-    # Save comparison plots
+        _write_jsonl(per_sample_path, per_sample)
+        fr_results["per_sample_path"] = per_sample_path.name
+        selection = fr_results.pop("comparison_samples")
+        selection_path = output_dir / f"{run_name}_comparison_manifest.json"
+        selection_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "seed": selection_seed,
+                    "length_definition": LENGTH_DEFINITION,
+                    "dataset_sha256": provenance["dataset_sha256"],
+                    "samples": selection,
+                },
+                indent=2,
+            )
+        )
+        fr_results["comparison_manifest_path"] = selection_path.name
+        report["free_running"] = fr_results
+    if device.type == "cuda":
+        provenance["peak_gpu_memory_mb"] = (
+            torch.cuda.max_memory_allocated(device) / 1024 / 1024
+        )
     if examples:
         from metrics.sketchformer.visualisation import save_reconstruction_examples
 
-        plots_dir = output_dir / f"{run_name}_plots"
-        saved = save_reconstruction_examples(examples, plots_dir)
-        print(f"[benchmark] wrote {len(saved)} comparison plots to {plots_dir}")
-
+        save_reconstruction_examples(examples, output_dir / f"{run_name}_plots")
+    report_path.write_text(
+        json.dumps(report, indent=2, allow_nan=False), encoding="utf-8"
+    )
+    print(f"[benchmark] wrote report to {report_path}")
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

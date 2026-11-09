@@ -55,18 +55,9 @@ class TestFailureAnalysis(unittest.TestCase):
                 for s in samples:
                     f.write(json.dumps(s) + "\n")
 
-            res = analyze_tf_fr_gap(tf_report_path, fr_samples_path, out_dir)
-
-            self.assertEqual(res["total_samples"], 3)
-            self.assertIn("short", res["per_bucket"])
-            self.assertIn("long", res["per_bucket"])
-            self.assertEqual(res["per_bucket"]["short"]["count"], 2)
-            self.assertAlmostEqual(res["per_bucket"]["short"]["fr_token_accuracy_mean"], 0.70)
-            self.assertEqual(res["per_bucket"]["long"]["count"], 1)
-            self.assertEqual(len(res["worst_20_samples"]), 3)
-            self.assertEqual(res["worst_20_samples"][0]["geometry_f1_2px"], 0.40)
-            # Gap using global fallback (0.82 - 0.70 = 0.12)
-            self.assertAlmostEqual(res["per_bucket"]["short"]["accuracy_gap_tf_minus_fr"], 0.12)
+            # A global score cannot stand in for bucket-aligned measurements.
+            with self.assertRaisesRegex(ValueError, "bucket-aligned"):
+                analyze_tf_fr_gap(tf_report_path, fr_samples_path, out_dir)
 
     def test_tf_fr_gap_with_per_bucket_tf(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -87,8 +78,16 @@ class TestFailureAnalysis(unittest.TestCase):
             tf_report_path.write_text(json.dumps(tf_data), encoding="utf-8")
 
             samples = [
-                {"length_bucket": "short", "token_accuracy": 0.70, "geometry_f1_2px": 0.85},
-                {"length_bucket": "long", "token_accuracy": 0.35, "geometry_f1_2px": 0.40},
+                {
+                    "length_bucket": "short",
+                    "token_accuracy": 0.70,
+                    "geometry_f1_2px": 0.85,
+                },
+                {
+                    "length_bucket": "long",
+                    "token_accuracy": 0.35,
+                    "geometry_f1_2px": 0.40,
+                },
             ]
             with open(fr_samples_path, "w", encoding="utf-8") as f:
                 for s in samples:
@@ -98,8 +97,12 @@ class TestFailureAnalysis(unittest.TestCase):
             # Bucket-aligned gaps:
             # short: 0.85 - 0.70 = 0.15
             # long: 0.70 - 0.35 = 0.35
-            self.assertAlmostEqual(res["per_bucket"]["short"]["accuracy_gap_tf_minus_fr"], 0.15)
-            self.assertAlmostEqual(res["per_bucket"]["long"]["accuracy_gap_tf_minus_fr"], 0.35)
+            self.assertAlmostEqual(
+                res["per_bucket"]["short"]["accuracy_gap_tf_minus_fr"], 0.15
+            )
+            self.assertAlmostEqual(
+                res["per_bucket"]["long"]["accuracy_gap_tf_minus_fr"], 0.35
+            )
 
     def test_position_accuracy_curves(self):
         # 2 samples:
@@ -118,7 +121,9 @@ class TestFailureAnalysis(unittest.TestCase):
             },
         ]
 
-        res = analyze_position_accuracy(records, onset_threshold=0.80, collapse_threshold=0.50)
+        res = analyze_position_accuracy(
+            records, onset_threshold=0.80, collapse_threshold=0.50
+        )
         overall = res["overall"]
         curve = overall["accuracy_curve"]
 
@@ -191,7 +196,9 @@ class TestFailureAnalysis(unittest.TestCase):
         res = analyze_quantization_error([stroke5], codebook)
         self.assertEqual(res["total_evaluated_points"], 2)
         self.assertEqual(res["total_evaluated_strokes"], 1)
-        self.assertAlmostEqual(res["point_quantization_error"]["mean"], 0.1414, places=3)
+        self.assertAlmostEqual(
+            res["point_quantization_error"]["mean"], 0.1414, places=3
+        )
 
     def test_latent_capacity_analysis(self):
         # 10 samples in 4 dimensions, centered with known variance
@@ -209,4 +216,3 @@ class TestFailureAnalysis(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

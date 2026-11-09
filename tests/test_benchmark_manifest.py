@@ -126,14 +126,15 @@ class TestBuildManifest(unittest.TestCase):
         # Pad to same length
         max_len = max(len(seq1), len(seq2), len(seq3))
         x = np.zeros((3, max_len), dtype=np.int64)
-        x[0, :len(seq1)] = seq1
-        x[1, :len(seq2)] = seq2
-        x[2, :len(seq3)] = seq3
+        x[0, : len(seq1)] = seq1
+        x[1, : len(seq2)] = seq2
+        x[2, : len(seq3)] = seq3
         y = np.array([0, 0, 0], dtype=np.int64)
         np.savez(self.dataset_root / "valid.npz", x=x, y=y)
 
     def tearDown(self) -> None:
         import shutil
+
         shutil.rmtree(self._tmp, ignore_errors=True)
 
     def test_builds_manifest_from_npz(self) -> None:
@@ -142,18 +143,26 @@ class TestBuildManifest(unittest.TestCase):
         records = build_manifest(self.dataset_root, "valid")
         self.assertEqual(len(records), 3)
         self.assertEqual(records[0]["split"], "valid")
-        self.assertTrue(records[0]["sample_id"].startswith("valid_"))
+        self.assertEqual(records[0]["sample_id"], "valid:0")
 
     def test_manifest_has_required_fields(self) -> None:
         from evals.benchmark_manifest import build_manifest
 
         records = build_manifest(self.dataset_root, "valid")
         required = {
-            "sample_id", "split", "token_length", "length_bucket",
-            "stroke_count", "sep_count", "detail_density", "separator_ratio",
+            "sample_id",
+            "split",
+            "token_length",
+            "length_bucket",
+            "stroke_count",
+            "sep_count",
+            "detail_density",
+            "separator_ratio",
         }
         for record in records:
-            self.assertTrue(required.issubset(record.keys()), f"Missing fields in {record}")
+            self.assertTrue(
+                required.issubset(record.keys()), f"Missing fields in {record}"
+            )
 
     def test_summarize_manifest(self) -> None:
         from evals.benchmark_manifest import build_manifest, summarize_manifest

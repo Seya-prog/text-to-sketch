@@ -6,7 +6,6 @@ import unittest
 from pathlib import Path
 
 import numpy as np
-import torch
 
 from evals.conversion_fidelity import compute_parity_metrics, evaluate_logits_files
 
@@ -18,7 +17,9 @@ class TestConversionFidelity(unittest.TestCase):
         res = compute_parity_metrics(logits, logits)
 
         self.assertEqual(res["status"], "PASS")
-        self.assertAlmostEqual(res["metrics"]["global_cosine_similarity"], 1.0, places=4)
+        self.assertAlmostEqual(
+            res["metrics"]["global_cosine_similarity"], 1.0, places=4
+        )
         self.assertAlmostEqual(res["metrics"]["argmax_agreement"], 1.0, places=4)
         self.assertAlmostEqual(res["metrics"]["max_absolute_difference"], 0.0, places=4)
         self.assertEqual(res["num_positions_evaluated"], 40)
@@ -31,7 +32,9 @@ class TestConversionFidelity(unittest.TestCase):
         noise = np.random.randn(2, 5, 50).astype(np.float32) * 1e-4
         candidate = reference + noise
 
-        res = compute_parity_metrics(candidate, reference, min_cosine=0.999, min_agreement=0.99)
+        res = compute_parity_metrics(
+            candidate, reference, min_cosine=0.999, min_agreement=0.99
+        )
         self.assertEqual(res["status"], "PASS")
         self.assertGreaterEqual(res["metrics"]["global_cosine_similarity"], 0.999)
         self.assertGreaterEqual(res["metrics"]["argmax_agreement"], 0.99)
@@ -60,8 +63,12 @@ class TestConversionFidelity(unittest.TestCase):
             out_dir = tmp_path / "output"
 
             data = np.random.randn(2, 4, 30).astype(np.float32)
-            np.savez(ref_path, logits=data)
-            np.savez(cand_path, logits=data)
+            np.savez(
+                ref_path, logits=data, valid_mask=np.ones(data.shape[:-1], dtype=bool)
+            )
+            np.savez(
+                cand_path, logits=data, valid_mask=np.ones(data.shape[:-1], dtype=bool)
+            )
 
             report = evaluate_logits_files(cand_path, ref_path, output_dir=out_dir)
             self.assertEqual(report["status"], "PASS")
@@ -74,4 +81,3 @@ class TestConversionFidelity(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
