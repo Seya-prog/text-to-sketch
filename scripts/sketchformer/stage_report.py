@@ -21,6 +21,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from pathlib import Path
 from typing import Any
@@ -40,7 +41,7 @@ import numpy as np
 
 from builders.config_utils import get_nested
 from dataloaders import StrokeSequenceDataModule
-from scripts.sketchformer.config import compose_training_config
+from scripts.sketchformer.config import batch_limit, compose_training_config
 from scripts.sketchformer.curriculum import compute_stage_updates, parse_curriculum
 
 
@@ -107,6 +108,7 @@ def _report_stages(
         get_nested(config, "trainer.training.target_tokens_per_step", 0) or 0
     )
     warmup_steps = int(get_nested(config, "optimizer.scheduler.warmup_steps", 0))
+    limit_train = get_nested(config, "trainer.training.limit_train_batches", 1.0)
 
     all_viable = True
 
@@ -130,14 +132,23 @@ def _report_stages(
         train_fitting = [l for l in train_lengths if l <= stage.max_length]
         valid_fitting = [l for l in valid_lengths if l <= stage.max_length]
 
-        updates = compute_stage_updates(
-            len(train_fitting),
-            stage.epochs,
-            batch_size,
-            accumulate,
-            target_tokens=target_tokens,
-            fitting_lengths=train_fitting,
-        )
+        # Compute updates using the actual loader so that bucket_by_length,
+        # max_tokens_per_batch, and limit_train_batches are all reflected.
+        is_empty = len(train_fitting) == 0
+        if is_empty:
+            updates = 0
+        else:
+            try:
+                stage_loader = datamodule.train_dataloader(stage.max_length)
+                num_batches = batch_limit(stage_loader, limit_train)
+            except Exception:
+                # Fall back to the simple calculation if loader fails.
+                num_batches = compute_stage_updates(
+                    len(train_fitting), 1, batch_size, 1,
+                    target_tokens=target_tokens,
+                    fitting_lengths=train_fitting,
+                )
+            updates = math.ceil(num_batches / accumulate) * stage.epochs
 
         train_stats = _length_stats(train_fitting)
         valid_stats = _length_stats(valid_fitting)

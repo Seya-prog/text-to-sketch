@@ -375,17 +375,15 @@ class StrokeSequenceDataModule:
             or 0
         )
         if max_tokens_per_batch > 0:
-            # Include special tokens (SOS, EOS) and padding alignment in
-            # the budget so the sampler never underestimates actual memory.
-            special_token_overhead = 0
-            if self.uses_token_format:
-                if bool(_get(self.config, "sequence.add_start_token", True)):
-                    special_token_overhead += 1
-                if bool(_get(self.config, "sequence.add_end_token", True)):
-                    special_token_overhead += 1
+            # Budget lengths include padding alignment only.
+            # For tok-dict data the stored lengths already contain SOS/EOS
+            # (added by prepare_sketchformer_tokens.py and preserved by
+            # TokenSequenceTransform which checks before inserting).
+            # Adding special_token_overhead here would double-count and
+            # make TokenBudgetBatchSampler reject legal sequences.
             pad_multiple = int(_get(self.config, "sequence.pad_to_multiple_of", 8))
             budgeted_lengths = [
-                _round_up(length + special_token_overhead, pad_multiple)
+                _round_up(length, pad_multiple)
                 for length in dataset.lengths
             ]
             batch_sampler = TokenBudgetBatchSampler(

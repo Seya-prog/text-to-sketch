@@ -36,6 +36,7 @@ from builders.config_utils import get_nested
 from core import CheckpointCallback, average_logs, move_to_device, set_seed
 from core.metrics import reconstruction_metrics
 from dataloaders import StrokeSequenceDataModule
+from dataloaders.datamodule import SequenceLengthSubset
 from scripts.sketchformer.config import (
     batch_limit,
     compose_training_config,
@@ -388,8 +389,12 @@ def main() -> int:
     held_out_loader = datamodule.val_dataloader(max_sequence_length=None)
 
     # Stage-progression log written alongside checkpoints.
+    # Truncate on fresh runs so old rows don't mix with new ones;
+    # append only when resuming from a checkpoint.
     stage_log_path = checkpoint_dir / "stage_log.jsonl"
     stage_log_path.parent.mkdir(parents=True, exist_ok=True)
+    if not resume_path and stage_log_path.exists():
+        stage_log_path.write_text("")
 
     for stage_index, stage in enumerate(curriculum_stages):
         start_stage_epoch = resume_epoch_for_stage(
@@ -402,17 +407,25 @@ def main() -> int:
             continue
 
         # ------------------------------------------------------------------
-        # Guard against empty stages: the stage report should have
-        # caught this, but if not, skip rather than crash.
+        # Guard against empty stages: check explicitly instead of using a
+        # blanket except-ValueError (which would hide config/data errors).
         # ------------------------------------------------------------------
-        try:
-            train_loader = datamodule.train_dataloader(stage.max_length)
-        except ValueError:
+        assert datamodule.train_dataset is not None
+        train_subset = SequenceLengthSubset(
+            datamodule.train_dataset,
+            datamodule.train_dataset.lengths,
+            stage.max_length,
+            allow_empty=True,
+        )
+        if len(train_subset) == 0:
             print(
                 f"[curriculum] WARNING stage={stage.name} has no training "
                 f"examples at max_length={stage.max_length} — skipping"
             )
+            # Advance global_epoch so resume_epoch_for_stage() stays correct.
+            global_epoch += stage.epochs
             continue
+        train_loader = datamodule.train_dataloader(stage.max_length)
 
         try:
             valid_loader = datamodule.val_dataloader(stage.max_length)
@@ -533,20 +546,26 @@ def main() -> int:
                         _divide_gradients(raw_model, 1.0 / correction)
                     if grad_clip is not None:
                         torch.nn.utils.clip_grad_norm_(raw_model.parameters(), float(grad_clip))
-                    precision.scaler.step(optimizer)
-                    precision.scaler.update()
 
                     # -------------------------------------------------------
-                    # Fix: only advance the LR schedule when a real optimizer
-                    # update happened (not when scaler skipped due to NaN).
+                    # Detect whether the scaler actually ran optimizer.step().
+                    # GradScaler skips the step on inf/NaN grads and reduces
+                    # its scale factor; we must NOT advance the scheduler or
+                    # global_step in that case.
                     # -------------------------------------------------------
-                    if scheduler.scheduler is not None:
-                        scheduler.scheduler.step()
+                    scale_before = precision.scaler.get_scale()
+                    precision.scaler.step(optimizer)
+                    precision.scaler.update()
+                    step_ran = precision.scaler.get_scale() >= scale_before
+
+                    if step_ran:
+                        if scheduler.scheduler is not None:
+                            scheduler.scheduler.step()
+                        global_step += 1
 
                     optimizer.zero_grad(set_to_none=True)
                     accumulated_tokens = 0
                     accumulated_micro = 0
-                    global_step += 1
 
                 if (batch_index + 1) % log_every == 0:
                     current_lr = optimizer.param_groups[0]["lr"]

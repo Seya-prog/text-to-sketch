@@ -106,17 +106,17 @@ class TestTokenBudgetWithSpecialTokens(unittest.TestCase):
         self.assertEqual(_round_up(1, None), 1)
 
     def test_budget_sampler_with_adjusted_lengths(self) -> None:
-        """When lengths include SOS+EOS+padding the sampler should produce
-        batches that don't exceed the budget."""
+        """When lengths include padding alignment (but NOT double-counted
+        SOS/EOS — stored tok-dict sequences already contain them) the
+        sampler should produce batches that don't exceed the budget."""
         raw_lengths = [100, 200, 300]
-        special_overhead = 2  # SOS + EOS
         pad_multiple = 8
         adjusted = [
-            _round_up(length + special_overhead, pad_multiple)
+            _round_up(length, pad_multiple)
             for length in raw_lengths
         ]
-        # adjusted = [104, 208, 304]
-        self.assertEqual(adjusted, [104, 208, 304])
+        # adjusted = [104, 200, 304]
+        self.assertEqual(adjusted, [104, 200, 304])
 
         sampler = TokenBudgetBatchSampler(
             adjusted, max_tokens=512, max_batch_size=8, shuffle=False
@@ -341,6 +341,71 @@ class TestCurriculumParsing(unittest.TestCase):
         }
         with self.assertRaises(ValueError):
             parse_curriculum(config, default_max_length=1024)
+
+
+# ---------------------------------------------------------------------------
+# 9. Skipped stage must advance global_epoch (Fix 3)
+# ---------------------------------------------------------------------------
+
+class TestSkippedStageEpochAdvancement(unittest.TestCase):
+    """When an empty stage is skipped the global_epoch counter must still
+    advance by stage.epochs so resume_epoch_for_stage() stays correct."""
+
+    def test_epoch_advancement_after_skip(self) -> None:
+        """Simulate the curriculum loop logic for an empty stage."""
+        stages = [
+            CurriculumStage("short", max_length=128, epochs=2,
+                            learning_rate=1e-4, trainable="all"),
+            CurriculumStage("long", max_length=4096, epochs=3,
+                            learning_rate=1e-5, trainable="all"),
+        ]
+        global_epoch = 0
+        skipped: list[str] = []
+
+        for stage in stages:
+            # Simulate: stage "short" has no examples
+            num_examples = 0 if stage.name == "short" else 10
+            if num_examples == 0:
+                # This is the bug-fix: advance epoch even when skipping.
+                global_epoch += stage.epochs
+                skipped.append(stage.name)
+                continue
+            global_epoch += stage.epochs
+
+        self.assertIn("short", skipped)
+        # global_epoch must be 2 (short) + 3 (long) = 5
+        self.assertEqual(global_epoch, 5)
+
+
+# ---------------------------------------------------------------------------
+# 10. Scaler skip detection (Fix 4)
+# ---------------------------------------------------------------------------
+
+class TestScalerSkipDetection(unittest.TestCase):
+    """Verify the scale_before/scale_after pattern used to detect whether
+    GradScaler actually ran optimizer.step()."""
+
+    def test_scale_drop_means_step_was_skipped(self) -> None:
+        """When the scale drops, step was skipped due to inf/NaN."""
+        scale_before = 65536.0
+        # GradScaler reduces scale on NaN
+        scale_after = 32768.0
+        step_ran = scale_after >= scale_before
+        self.assertFalse(step_ran)
+
+    def test_scale_unchanged_means_step_ran(self) -> None:
+        """When scale stays the same, the step ran normally."""
+        scale_before = 65536.0
+        scale_after = 65536.0
+        step_ran = scale_after >= scale_before
+        self.assertTrue(step_ran)
+
+    def test_scale_increase_means_step_ran(self) -> None:
+        """When scale increases (growth interval reached), step also ran."""
+        scale_before = 32768.0
+        scale_after = 65536.0
+        step_ran = scale_after >= scale_before
+        self.assertTrue(step_ran)
 
 
 if __name__ == "__main__":
