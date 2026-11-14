@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import json
 import math
 import sys
 from contextlib import nullcontext
@@ -44,6 +45,8 @@ from scripts.sketchformer.config import (
     resolve_device,
 )
 from scripts.sketchformer.curriculum import (
+    clamp_warmup,
+    compute_stage_updates,
     parse_curriculum,
     resume_epoch_for_stage,
     set_trainable_scope,
@@ -265,6 +268,8 @@ def _validate(
     config: dict[str, Any],
     device: torch.device,
     precision: PrecisionRuntime,
+    *,
+    log_prefix: str = "val",
 ) -> dict[str, torch.Tensor]:
     model.eval()
     logs = []
@@ -276,10 +281,14 @@ def _validate(
                 output = model(batch)
                 loss_output = loss_fn(output, batch)
                 metric_output = reconstruction_metrics(output, batch)
-            step_logs = loss_output.as_log_dict(prefix="val")
-            step_logs.update(metric_output.as_log_dict(prefix="val"))
+            step_logs = loss_output.as_log_dict(prefix=log_prefix)
+            step_logs.update(metric_output.as_log_dict(prefix=log_prefix))
             logs.append(step_logs)
-    weight_key = "val/valid_tokens" if logs and "val/valid_tokens" in logs[0] else None
+    weight_key = (
+        f"{log_prefix}/valid_tokens"
+        if logs and f"{log_prefix}/valid_tokens" in logs[0]
+        else None
+    )
     return average_logs(logs, weight_key=weight_key)
 
 
@@ -366,8 +375,21 @@ def main() -> int:
     early_stopping_patience = int(
         get_nested(config, "trainer.curriculum.early_stopping_patience", 0) or 0
     )
+    configured_warmup = int(
+        get_nested(config, "optimizer.scheduler.warmup_steps", 0)
+    )
     global_step = resume_result.step if resume_result is not None else 0
     global_epoch = resume_result.epoch if resume_result is not None else 0
+
+    # ------------------------------------------------------------------
+    # Fixed held-out validation set: always the full validation split
+    # so scores are comparable across curriculum stages.
+    # ------------------------------------------------------------------
+    held_out_loader = datamodule.val_dataloader(max_sequence_length=None)
+
+    # Stage-progression log written alongside checkpoints.
+    stage_log_path = checkpoint_dir / "stage_log.jsonl"
+    stage_log_path.parent.mkdir(parents=True, exist_ok=True)
 
     for stage_index, stage in enumerate(curriculum_stages):
         start_stage_epoch = resume_epoch_for_stage(
@@ -378,13 +400,33 @@ def main() -> int:
         if start_stage_epoch >= stage.epochs:
             print(f"[curriculum] skip completed stage={stage.name}")
             continue
-        train_loader = datamodule.train_dataloader(stage.max_length)
-        valid_loader = datamodule.val_dataloader(stage.max_length)
+
+        # ------------------------------------------------------------------
+        # Guard against empty stages: the stage report should have
+        # caught this, but if not, skip rather than crash.
+        # ------------------------------------------------------------------
+        try:
+            train_loader = datamodule.train_dataloader(stage.max_length)
+        except ValueError:
+            print(
+                f"[curriculum] WARNING stage={stage.name} has no training "
+                f"examples at max_length={stage.max_length} — skipping"
+            )
+            continue
+
+        try:
+            valid_loader = datamodule.val_dataloader(stage.max_length)
+        except ValueError:
+            # Fall back to full validation set if the stage filter is empty.
+            valid_loader = held_out_loader
+
         trainable_parameters = set_trainable_scope(raw_model, stage.trainable)
         optimizer_config = copy.deepcopy(config["optimizer"])
         if not math.isnan(stage.learning_rate):
             optimizer_config.setdefault("optimizer", {})["lr"] = stage.learning_rate
         optimizer = build_optimizer(raw_model, optimizer_config)
+
+        # Compute total optimizer updates for this stage.
         if target_tokens > 0:
             dataset_tokens = sum(int(length) for length in train_loader.dataset.lengths)
             total_steps = max(1, math.ceil(dataset_tokens / target_tokens) * stage.epochs)
@@ -392,11 +434,25 @@ def main() -> int:
             stage_config = copy.deepcopy(config)
             stage_config["trainer"]["training"]["max_epochs"] = stage.epochs
             total_steps = _total_optimizer_steps(stage_config, train_loader)
+
+        # ------------------------------------------------------------------
+        # Fix: clamp warmup so it never exceeds the stage's update budget.
+        # ------------------------------------------------------------------
+        effective_warmup = clamp_warmup(configured_warmup, total_steps)
+        if effective_warmup != configured_warmup:
+            print(
+                f"[curriculum] warmup clamped {configured_warmup} → "
+                f"{effective_warmup} for stage={stage.name} "
+                f"(total_steps={total_steps})"
+            )
+        stage_scheduler_config = copy.deepcopy(optimizer_config)
+        stage_scheduler_config.setdefault("scheduler", {})["warmup_steps"] = effective_warmup
         scheduler = build_scheduler(
             optimizer,
-            optimizer_config,
+            stage_scheduler_config,
             total_steps=total_steps,
         )
+
         if resume_path and start_stage_epoch > 0:
             from core import load_checkpoint
 
@@ -418,7 +474,8 @@ def main() -> int:
         print(
             f"[curriculum] stage={stage.name} max_length={stage.max_length} "
             f"epochs={stage.epochs} trainable={stage.trainable} "
-            f"parameters={trainable_parameters} lr={optimizer.param_groups[0]['lr']:.8g}"
+            f"parameters={trainable_parameters} lr={optimizer.param_groups[0]['lr']:.8g} "
+            f"total_steps={total_steps} warmup={effective_warmup}"
         )
 
         for stage_epoch in range(start_stage_epoch, stage.epochs):
@@ -428,6 +485,7 @@ def main() -> int:
             train_logs = []
             num_batches = batch_limit(train_loader, limit_train)
             accumulated_tokens = 0
+            accumulated_micro = 0  # micro-batches accumulated so far
 
             for batch_index, batch in enumerate(limited(train_loader, limit_train)):
                 batch = move_to_device(batch, device)
@@ -447,31 +505,56 @@ def main() -> int:
 
                 precision.scaler.scale(scaled_loss).backward()
                 accumulated_tokens += batch_tokens
+                accumulated_micro += 1
                 train_logs.append(loss_output.as_log_dict(prefix="train"))
 
-                should_step = (
+                is_full_accumulation = (
                     (target_tokens > 0 and accumulated_tokens >= target_tokens)
                     or (target_tokens <= 0 and (batch_index + 1) % accumulate == 0)
-                    or (batch_index + 1) == num_batches
                 )
+                is_last_batch = (batch_index + 1) == num_batches
+
+                should_step = is_full_accumulation or is_last_batch
+
                 if should_step:
                     precision.scaler.unscale_(optimizer)
                     if target_tokens > 0:
                         _divide_gradients(raw_model, float(accumulated_tokens))
+                    elif not is_full_accumulation and is_last_batch:
+                        # -------------------------------------------------------
+                        # Fix: partial gradient group at epoch/stage end.
+                        # Re-weight so the final partial group has the correct
+                        # effective learning-rate contribution.  The loss was
+                        # divided by ``accumulate`` in each micro-batch; we
+                        # need to multiply by ``accumulate / actual`` to
+                        # compensate.
+                        # -------------------------------------------------------
+                        correction = float(accumulate) / float(accumulated_micro)
+                        _divide_gradients(raw_model, 1.0 / correction)
                     if grad_clip is not None:
                         torch.nn.utils.clip_grad_norm_(raw_model.parameters(), float(grad_clip))
                     precision.scaler.step(optimizer)
                     precision.scaler.update()
+
+                    # -------------------------------------------------------
+                    # Fix: only advance the LR schedule when a real optimizer
+                    # update happened (not when scaler skipped due to NaN).
+                    # -------------------------------------------------------
                     if scheduler.scheduler is not None:
                         scheduler.scheduler.step()
+
                     optimizer.zero_grad(set_to_none=True)
                     accumulated_tokens = 0
+                    accumulated_micro = 0
                     global_step += 1
 
                 if (batch_index + 1) % log_every == 0:
+                    current_lr = optimizer.param_groups[0]["lr"]
                     print(
                         f"stage={stage.name} epoch={stage_epoch + 1} "
-                        f"batch={batch_index + 1} {format_logs(train_logs[-1])}"
+                        f"batch={batch_index + 1} lr={current_lr:.8g} "
+                        f"step={global_step} "
+                        f"{format_logs(train_logs[-1])}"
                     )
 
             train_weight_key = (
@@ -480,7 +563,19 @@ def main() -> int:
                 else None
             )
             train_epoch_logs = average_logs(train_logs, weight_key=train_weight_key)
-            val_logs = _validate(model, valid_loader, loss_fn, config, device, precision)
+
+            # Stage-filtered validation.
+            val_logs = _validate(
+                model, valid_loader, loss_fn, config, device, precision,
+                log_prefix="val",
+            )
+
+            # Fixed held-out validation (same set across all stages).
+            held_out_logs = _validate(
+                model, held_out_loader, loss_fn, config, device, precision,
+                log_prefix="held_out",
+            )
+
             saved = checkpoint_callback.on_validation_end(
                 raw_model,
                 optimizer=optimizer,
@@ -491,6 +586,10 @@ def main() -> int:
             )
             non_improving = 0 if "best" in saved else non_improving + 1
 
+            # ------------------------------------------------------------------
+            # Log: record stage, LR, and update count for post-hoc analysis.
+            # ------------------------------------------------------------------
+            current_lr = optimizer.param_groups[0]["lr"]
             print(
                 f"stage={stage.name} epoch={stage_epoch + 1} "
                 f"train {format_logs(train_epoch_logs)}"
@@ -499,6 +598,31 @@ def main() -> int:
                 f"stage={stage.name} epoch={stage_epoch + 1} "
                 f"valid {format_logs(val_logs)}"
             )
+            print(
+                f"stage={stage.name} epoch={stage_epoch + 1} "
+                f"held_out {format_logs(held_out_logs)}"
+            )
+            print(
+                f"stage={stage.name} epoch={stage_epoch + 1} "
+                f"lr={current_lr:.8g} global_step={global_step}"
+            )
+
+            stage_entry = {
+                "stage": stage.name,
+                "stage_epoch": stage_epoch + 1,
+                "global_epoch": global_epoch,
+                "global_step": global_step,
+                "lr": current_lr,
+                "max_length": stage.max_length,
+                "trainable": stage.trainable,
+            }
+            for key, value in val_logs.items():
+                stage_entry[key] = float(value.detach().cpu())
+            for key, value in held_out_logs.items():
+                stage_entry[key] = float(value.detach().cpu())
+            with open(stage_log_path, "a", encoding="utf-8") as log_file:
+                log_file.write(json.dumps(stage_entry) + "\n")
+
             is_final_stage = stage_index == len(curriculum_stages) - 1
             if (
                 is_final_stage

@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import torch
 
@@ -102,6 +103,44 @@ def resume_epoch_for_stage(
         raise IndexError("stage_index is outside the curriculum")
     before = sum(stage.epochs for stage in stages[:stage_index])
     return min(stages[stage_index].epochs, max(0, int(completed_epochs) - before))
+
+
+def compute_stage_updates(
+    num_examples: int,
+    epochs: int,
+    batch_size: int,
+    accumulate: int,
+    *,
+    target_tokens: int = 0,
+    fitting_lengths: Sequence[int] = (),
+) -> int:
+    """Compute the number of optimizer updates a curriculum stage can produce.
+
+    When *target_tokens* > 0 (token-budget accumulation), updates are derived
+    from the total token count divided by the target budget.  Otherwise,
+    batch-count-based accumulation is used.
+    """
+    if num_examples <= 0:
+        return 0
+    if target_tokens > 0 and fitting_lengths:
+        total_tokens = sum(int(length) for length in fitting_lengths)
+        updates_per_epoch = max(1, math.ceil(total_tokens / target_tokens))
+        return updates_per_epoch * epochs
+    batches_per_epoch = max(1, math.ceil(num_examples / max(1, batch_size)))
+    updates_per_epoch = max(1, math.ceil(batches_per_epoch / max(1, accumulate)))
+    return updates_per_epoch * epochs
+
+
+def clamp_warmup(configured_warmup: int, stage_updates: int) -> int:
+    """Return warmup steps clamped to at most 80 % of available stage updates.
+
+    A warmup that exceeds the stage length means the model never reaches
+    the target learning rate.  This helper silently reduces warmup so the
+    cosine-decay phase gets at least 20 % of the stage.
+    """
+    if stage_updates <= 0:
+        return 0
+    return min(configured_warmup, max(1, int(stage_updates * 0.8)))
 
 
 def _set_module_trainable(module: torch.nn.Module) -> None:

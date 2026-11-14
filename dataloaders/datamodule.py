@@ -32,6 +32,13 @@ def _get(config: Mapping[str, Any], path: str, default: Any = None) -> Any:
     return current
 
 
+def _round_up(value: int, multiple: int | None) -> int:
+    """Round *value* up to the nearest *multiple*."""
+    if not multiple or multiple <= 1:
+        return value
+    return ((value + multiple - 1) // multiple) * multiple
+
+
 class LengthBucketBatchSampler(Sampler[list[int]]):
     """Group sequence indices with similar lengths into batches."""
 
@@ -162,13 +169,26 @@ class TokenBudgetBatchSampler(Sampler[list[int]]):
 
 
 class SequenceLengthSubset(Dataset):
-    """Read-only dataset view containing complete sequences up to a stage limit."""
+    """Read-only dataset view containing complete sequences up to a stage limit.
 
-    def __init__(self, dataset: Dataset, lengths: Sequence[int], max_length: int) -> None:
+    When *allow_empty* is ``False`` (the default) an empty subset raises
+    ``ValueError`` so the caller learns immediately.  Set *allow_empty* to
+    ``True`` when you want to handle the empty case yourself (e.g. skip a
+    curriculum stage instead of crashing).
+    """
+
+    def __init__(
+        self,
+        dataset: Dataset,
+        lengths: Sequence[int],
+        max_length: int,
+        *,
+        allow_empty: bool = False,
+    ) -> None:
         self.dataset = dataset
         self.indices = [index for index, length in enumerate(lengths) if length <= max_length]
         self._lengths = [int(lengths[index]) for index in self.indices]
-        if not self.indices:
+        if not self.indices and not allow_empty:
             raise ValueError(f"No complete sequences fit curriculum max_length={max_length}")
 
     def __len__(self) -> int:
@@ -355,8 +375,21 @@ class StrokeSequenceDataModule:
             or 0
         )
         if max_tokens_per_batch > 0:
+            # Include special tokens (SOS, EOS) and padding alignment in
+            # the budget so the sampler never underestimates actual memory.
+            special_token_overhead = 0
+            if self.uses_token_format:
+                if bool(_get(self.config, "sequence.add_start_token", True)):
+                    special_token_overhead += 1
+                if bool(_get(self.config, "sequence.add_end_token", True)):
+                    special_token_overhead += 1
+            pad_multiple = int(_get(self.config, "sequence.pad_to_multiple_of", 8))
+            budgeted_lengths = [
+                _round_up(length + special_token_overhead, pad_multiple)
+                for length in dataset.lengths
+            ]
             batch_sampler = TokenBudgetBatchSampler(
-                dataset.lengths,
+                budgeted_lengths,
                 max_tokens=max_tokens_per_batch,
                 max_batch_size=batch_size,
                 shuffle=is_train,
